@@ -7,7 +7,7 @@
 #endif
 
 // --- Bluetooth Setup ---
-uint8_t     BT_MAC[6] = {0x13, 0xE0, 0x2F, 0x8D, 0x64, 0x43};
+uint8_t     BT_MAC[6] = {Enter MAC Adress in HEX};
 const char* BT_PIN    = "1234";
 
 TFT_eSPI      tft = TFT_eSPI();
