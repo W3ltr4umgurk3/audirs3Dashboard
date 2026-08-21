@@ -11,7 +11,7 @@
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
 // --- Hardware & Bluetooth Setup ---
-uint8_t     BT_MAC[6] = {0x13, 0xE0, 0x2F, 0x8D, 0x64, 0x43};
+uint8_t   BT_MAC[6] = {0x13, 0xE0, 0x2F, 0x8D, 0x64, 0x43};
 const char* BT_PIN    = "1234";
 
 TFT_eSPI    tft = TFT_eSPI();
@@ -44,15 +44,15 @@ struct Gauge {
   bool   trackMax; 
 };
 
-// 7 Gauges: Index 0-5 für TFT Display, Index 6 nur für Öltemperatur (App)
+// 7 Gauges: Indices 0..5 werden auf dem TFT gezeichnet, Index 6 im Hintergrund (BLE only)
 Gauge gauges[7] = {
-  {"Kuehlwasser", "C",    0.f, -100.f, -1.0f,  105.0f, 0.0f, 120.0f, false, true},  // 0
-  {"Ladedruck",   "bar",  0.f, -1.0f,  -0.9f,    1.5f, -1.0f,   2.0f, false, true},  // 1
-  {"Getriebe",    "C",    0.f, -100.f, 20.0f,  110.0f, 0.f,  130.0f, false, true},  // 2
-  {"Ansaugtemp",  "C",    0.f, -100.f, -20.f,   60.0f, -20.f,  80.0f, false, true},  // 3
-  {"Tankinhalt",  "L",    0.f, -100.f,  5.0f,   60.0f,  0.f,   60.0f, false, false}, // 4
-  {"Batterie",    "V",    0.f, -100.f, 11.5f,   15.3f, 10.f,   16.0f, false, true},  // 5
-  {"Oeltemp",     "C",    0.f, -100.f, -1.0f,  110.0f, 0.0f, 130.0f, false, true}   // 6 (Nur BLE)
+  {"Kuehlwasser", "C",    0.f, -100.f, -1.0f,  105.0f, 0.0f, 120.0f, false, true},  // 0 (TFT 1)
+  {"Ladedruck",   "bar",  0.f, -1.0f,  -0.9f,    1.5f, -1.0f,   2.0f, false, true},  // 1 (TFT 2)
+  {"Getriebe",    "C",    0.f, -100.f, 20.0f,  110.0f, 0.f,  130.0f, false, true},  // 2 (TFT 3)
+  {"Ansaugtemp",  "C",    0.f, -100.f, -20.f,   60.0f, -20.f,  80.0f, false, true},  // 3 (TFT 4)
+  {"Tankinhalt",  "L",    0.f, -100.f,  5.0f,   60.0f,  0.f,   60.0f, false, false}, // 4 (TFT 5)
+  {"Batterie",    "V",    0.f, -100.f, 11.5f,   15.3f, 10.f,   16.0f, false, true},  // 5 (TFT 6)
+  {"Oeltemp",     "C",    0.f, -100.f, -1.0f,  110.0f, 0.0f, 130.0f, false, true}   // 6 (BLE only)
 };
 
 struct PIDDef { uint8_t mode; uint16_t pid; uint32_t header; bool isExtended; };
@@ -61,9 +61,9 @@ const PIDDef pidDefs[7] = {
   { 1, 0x0B,   0x7DF, false}, // 1: Ladedruck
   {22, 0x2104, 0x7E1, false}, // 2: Getriebe
   { 1, 0x0F,   0x7DF, false}, // 3: Ansaugtemp
-  { 1, 0x2F,   0x7DF, false}, // 4: Tank
+  { 1, 0x2F,   0x7DF, false}, // 4: Tankinhalt
   { 1, 0x42,   0x7DF, false}, // 5: Batterie
-  { 1, 0x5C,   0x7DF, false}  // 6: Öltemperatur (Standard OBD2 PID 5C)
+  {22, 0x1121, 0x7E0, false}  // 6: Öltemperatur (VAG UDS 16-Bit)
 };
 
 bool btConnected = false, elmReady = false, needFullRedraw = true;
@@ -77,10 +77,12 @@ class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) override {
       bleClientConnected = true;
       needFullRedraw = true;
+      Serial.println("[BLE] Client verbunden!");
     }
     void onDisconnect(BLEServer* pServer) override {
       bleClientConnected = false;
       needFullRedraw = true;
+      Serial.println("[BLE] Client getrennt -> Werbe wieder für Verbindungen...");
       BLEDevice::startAdvertising();
     }
 };
@@ -159,7 +161,10 @@ void queryGauge(uint8_t idx) {
   if (def.mode == 1) snprintf(cmd, sizeof(cmd), "01%02X1", (uint8_t)def.pid);
   else               snprintf(cmd, sizeof(cmd), "22%04X1", def.pid);
 
-  if (!elmRawCmd(cmd, (idx <= 1 ? 800 : 350))) return;
+  if (!elmRawCmd(cmd, (idx <= 1 ? 800 : 350))) {
+    Serial.printf("[OBD TIMEOUT] Befehl: %s | Keine Antwort vom ELM327\n", cmd);
+    return;
+  }
   
   char search[12];
   if (def.mode == 1) sprintf(search, "41%02X", (uint8_t)def.pid);
@@ -186,38 +191,49 @@ void queryGauge(uint8_t idx) {
       gauges[idx].value = smoothedVolt;
     }
     else if (def.mode == 1) {
-      if (def.pid == 0x2F) gauges[idx].value = ((float)hexByte(p) * 100.0f / 255.0f) * 0.55f;
-      else                 gauges[idx].value = (float)hexByte(p) - 40.0f; // Passt für Ansaugtemp (0x0F) und Öltemp (0x5C)
+      if (def.pid == 0x2F) gauges[idx].value = ((float)hexByte(p) * 100.0f / 255.0f) * 0.55f; // Tankinhalt
+      else                 gauges[idx].value = (float)hexByte(p) - 40.0f; // Ansaugtemp
     }
     else if (def.pid == 0x2104) { // Getriebe
       gauges[idx].value = (float)hexByte(p); 
+    }
+    else if (def.pid == 0x1121) { // Öltemperatur (VAG UDS 16-Bit: raw / 512.0)
+      uint16_t raw16 = ((uint16_t)hexByte(p) << 8) | hexByte(p + 2);
+      gauges[idx].value = (float)raw16 / 512.0f;
     }
     
     if (gauges[idx].trackMax) {
       if (gauges[idx].value > gauges[idx].maxValue) gauges[idx].maxValue = gauges[idx].value;
     }
     gauges[idx].hasValue = true;
+
+    Serial.printf("[OBD RX] %-11s | Raw: %-20s | Wert: %.1f %s\n", 
+                  gauges[idx].label, rawBuf, gauges[idx].value, gauges[idx].unit);
+  } else {
+    Serial.printf("[OBD PARSE ERR] %-11s | Match '%s' nicht in Raw '%s' gefunden\n", 
+                  gauges[idx].label, search, rawBuf);
   }
 }
 
-// Sendet alle Werte inkl. Öltemperatur per BLE an die App
 void sendBleJsonData() {
   if (!bleClientConnected) return;
 
   char jsonBuffer[256];
   snprintf(jsonBuffer, sizeof(jsonBuffer),
            "{\"water\":%.1f,\"boost\":%.2f,\"gearTemp\":%.1f,\"intake\":%.1f,\"fuel\":%d,\"volt\":%.1f,\"oil\":%.1f}\n",
-           gauges[0].value,        // Kuehlwasser
-           gauges[1].value,        // Ladedruck
-           gauges[2].value,        // Getriebe
-           gauges[3].value,        // Ansaugtemp
-           (int)gauges[4].value,   // Tankinhalt
-           gauges[5].value,        // Batterie
-           gauges[6].value         // Öltemperatur
+           gauges[0].value,   // Kuehlwasser
+           gauges[1].value,   // Ladedruck
+           gauges[2].value,   // Getriebe
+           gauges[3].value,   // Ansaugtemp
+           (int)gauges[4].value, // Tankinhalt
+           gauges[5].value,   // Batterie
+           gauges[6].value    // Öltemp
   );
 
   pCharacteristic->setValue(jsonBuffer);
   pCharacteristic->notify();
+
+  Serial.printf("[BLE TX] %s", jsonBuffer);
 }
 
 void drawTile(uint8_t i) {
@@ -297,7 +313,7 @@ void drawDashboard(bool full) {
     tft.fillScreen(TFT_BLACK);
     drawHeader();
   }
-  // Nur die ersten 6 Gauges (Index 0 bis 5) auf das TFT zeichnen
+  // Zeichne die ersten 6 Kacheln (Indices 0 bis 5) auf das TFT
   for (uint8_t i = 0; i < 6; i++) drawTile(i);
   if (!full) drawHeader();
 }
@@ -361,27 +377,26 @@ void loop() {
       btConnected = true;
       btConnectTime = millis();
     }
-    // Nach erfolgreicher BT-Kopplung erst 2 Sekunden warten, bevor ATZ gesendet wird
     if (!elmReady && (now - btConnectTime > 2000)) { 
       elmReady = initELM(); 
       needFullRedraw = true; 
     }
   }
 
-  // 2. OBD Werte abfragen (Zyklus geht jetzt von 0 bis 6, inkl. Öltemperatur)
+  // 2. OBD Werte abfragen (0 bis 6)
   if (elmReady) { 
     queryGauge(currentGauge); 
     currentGauge = (currentGauge + 1) % 7; 
   }
 
-  // 3. Display Refresh
+  // 3. Display Refresh (Aktualisiert die 6 Kacheln auf dem TFT)
   if (now - lastRedraw > 300) { 
     lastRedraw = now; 
     drawDashboard(needFullRedraw); 
     needFullRedraw = false; 
   }
 
-  // 4. BLE Live-Daten an App senden
+  // 4. BLE Live-Daten an App senden (Überträgt alle 7 Werte)
   if (now - lastBleNotify > 200) {
     lastBleNotify = now;
     sendBleJsonData();
