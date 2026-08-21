@@ -10,6 +10,7 @@
             "includePath": [
                 "C:/Users/elias/Documents/audirs3Dashboard/include",
                 "C:/Users/elias/Documents/audirs3Dashboard/src",
+                "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/BLE/src",
                 "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/BluetoothSerial/src",
                 "C:/Users/elias/Documents/audirs3Dashboard/.pio/libdeps/esp32dev/TFT_eSPI",
                 "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/LittleFS/src",
@@ -215,7 +216,6 @@
                 "C:/Users/elias/Documents/audirs3Dashboard/lib/TFT_eSPI-master",
                 "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/ArduinoOTA/src",
                 "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/AsyncUDP/src",
-                "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/BLE/src",
                 "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/DNSServer/src",
                 "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/EEPROM/src",
                 "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/ESP32/src",
@@ -248,6 +248,7 @@
                 "path": [
                     "C:/Users/elias/Documents/audirs3Dashboard/include",
                     "C:/Users/elias/Documents/audirs3Dashboard/src",
+                    "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/BLE/src",
                     "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/BluetoothSerial/src",
                     "C:/Users/elias/Documents/audirs3Dashboard/.pio/libdeps/esp32dev/TFT_eSPI",
                     "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/LittleFS/src",
@@ -453,7 +454,6 @@
                     "C:/Users/elias/Documents/audirs3Dashboard/lib/TFT_eSPI-master",
                     "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/ArduinoOTA/src",
                     "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/AsyncUDP/src",
-                    "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/BLE/src",
                     "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/DNSServer/src",
                     "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/EEPROM/src",
                     "C:/Users/elias/.platformio/packages/framework-arduinoespressif32/libraries/ESP32/src",
