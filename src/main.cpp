@@ -21,7 +21,9 @@ BluetoothSerial SerialBT;
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
 bool bleClientConnected = false;
+bool oldBleClientConnected = false; // Für Zustandserkennung im Loop
 uint32_t lastBleNotify = 0;
+uint32_t lastBleStatusCheck = 0;
 
 #define SCREEN_W  320
 #define SCREEN_H  240
@@ -74,16 +76,15 @@ char rawBuf[128];
 float smoothedVolt = 0.0f;
 
 class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) override {
+    void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
       bleClientConnected = true;
       needFullRedraw = true;
-      Serial.println("[BLE] Client verbunden!");
+      Serial.printf("[BLE] Client verbunden! Conn ID: %d\n", param->connect.conn_id);
     }
     void onDisconnect(BLEServer* pServer) override {
       bleClientConnected = false;
       needFullRedraw = true;
-      Serial.println("[BLE] Client getrennt -> Werbe wieder für Verbindungen...");
-      BLEDevice::startAdvertising();
+      Serial.println("[BLE] Client getrennt!");
     }
 };
 
@@ -313,7 +314,6 @@ void drawDashboard(bool full) {
     tft.fillScreen(TFT_BLACK);
     drawHeader();
   }
-  // Zeichne die ersten 6 Kacheln (Indices 0 bis 5) auf das TFT
   for (uint8_t i = 0; i < 6; i++) drawTile(i);
   if (!full) drawHeader();
 }
@@ -340,6 +340,7 @@ void setupBLE() {
   pAdvertising->setMinPreferred(0x06);
   pAdvertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
+  Serial.println("[BLE] Gestartet. Advertising aktiv...");
 }
 
 void setup() {
@@ -383,23 +384,45 @@ void loop() {
     }
   }
 
-  // 2. OBD Werte abfragen (0 bis 6)
+  // 2. BLE Reconnect Handling (Verbindungstrennung verarbeiten)
+  if (!bleClientConnected && oldBleClientConnected) {
+    delay(500); // Bluetooth-Stack entlasten
+    pServer->startAdvertising(); 
+    Serial.println("[BLE] Client getrennt -> Advertising sauber neu gestartet!");
+    oldBleClientConnected = bleClientConnected;
+  }
+
+  if (bleClientConnected && !oldBleClientConnected) {
+    oldBleClientConnected = bleClientConnected;
+  }
+
+  // 3. OBD Werte abfragen (0 bis 6)
   if (elmReady) { 
     queryGauge(currentGauge); 
     currentGauge = (currentGauge + 1) % 7; 
   }
 
-  // 3. Display Refresh (Aktualisiert die 6 Kacheln auf dem TFT)
+  // 4. Display Refresh (Aktualisiert die 6 Kacheln auf dem TFT)
   if (now - lastRedraw > 300) { 
     lastRedraw = now; 
     drawDashboard(needFullRedraw); 
     needFullRedraw = false; 
   }
 
-  // 4. BLE Live-Daten an App senden (Überträgt alle 7 Werte)
-  if (now - lastBleNotify > 200) {
+  // 5. BLE Live-Daten an App senden
+  if (bleClientConnected && (now - lastBleNotify > 200)) {
     lastBleNotify = now;
     sendBleJsonData();
+  }
+
+  // 6. Diagnostischer BLE Heartbeat im Serial Monitor (alle 5 Sekunden)
+  if (now - lastBleStatusCheck > 5000) {
+    lastBleStatusCheck = now;
+    if (bleClientConnected) {
+      Serial.println("[BLE DEBUG] Zustand: VERBUNDEN mit App");
+    } else {
+      Serial.println("[BLE DEBUG] Zustand: BEREIT / Advertising aktiv");
+    }
   }
 
   yield();
