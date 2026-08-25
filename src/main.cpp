@@ -65,7 +65,7 @@ const PIDDef pidDefs[7] = {
   { 1, 0x0F,   0x7DF, false}, // 3: Ansaugtemp
   { 1, 0x2F,   0x7DF, false}, // 4: Tankinhalt
   { 1, 0x42,   0x7DF, false}, // 5: Batterie
-  {22, 0x1121, 0x7E0, false}  // 6: Öltemperatur (VAG UDS 16-Bit)
+  { 1, 0x5C,   0x7DF, false}  // 6: Öltemperatur (Standard OBD-II PID 5C)
 };
 
 bool btConnected = false, elmReady = false, needFullRedraw = true;
@@ -159,8 +159,8 @@ void queryGauge(uint8_t idx) {
     lastSessionKeepAlive = millis();
   }
 
-  if (def.mode == 1) snprintf(cmd, sizeof(cmd), "01%02X1", (uint8_t)def.pid);
-  else               snprintf(cmd, sizeof(cmd), "22%04X1", def.pid);
+  if (def.mode == 1) snprintf(cmd, sizeof(cmd), "01%02X", (uint8_t)def.pid);
+  else               snprintf(cmd, sizeof(cmd), "22%04X", def.pid);
 
   if (!elmRawCmd(cmd, (idx <= 1 ? 800 : 350))) {
     Serial.printf("[OBD TIMEOUT] Befehl: %s | Keine Antwort vom ELM327\n", cmd);
