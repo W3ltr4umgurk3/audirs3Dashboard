@@ -21,7 +21,7 @@ BluetoothSerial SerialBT;
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
 bool bleClientConnected = false;
-bool oldBleClientConnected = false; // Für Zustandserkennung im Loop
+bool oldBleClientConnected = false;
 uint32_t lastBleNotify = 0;
 uint32_t lastBleStatusCheck = 0;
 
@@ -46,26 +46,26 @@ struct Gauge {
   bool   trackMax; 
 };
 
-// 7 Gauges: Indices 0..5 werden auf dem TFT gezeichnet, Index 6 im Hintergrund (BLE only)
+// 7 Gauges: Indices 0..5 TFT, Index 6 BLE (Hintergrund)
 Gauge gauges[7] = {
   {"Kuehlwasser", "C",    0.f, -100.f, -1.0f,  105.0f, 0.0f, 120.0f, false, true},  // 0 (TFT 1)
-  {"Ladedruck",   "bar",  0.f, -1.0f,  -0.9f,    1.5f, -1.0f,   2.0f, false, true},  // 1 (TFT 2)
-  {"Getriebe",    "C",    0.f, -100.f, 20.0f,  110.0f, 0.f,  130.0f, false, true},  // 2 (TFT 3)
+  {"Ladedruck",   "bar",  0.f, -100.f, -0.9f,    1.5f, -1.0f,   2.0f, false, true},  // 1 (TFT 2)
+  {"Getriebe",    "C",    0.f, -100.f, 20.0f,  110.0f, 0.f,   130.0f, false, true},  // 2 (TFT 3)
   {"Ansaugtemp",  "C",    0.f, -100.f, -20.f,   60.0f, -20.f,  80.0f, false, true},  // 3 (TFT 4)
   {"Tankinhalt",  "L",    0.f, -100.f,  5.0f,   60.0f,  0.f,   60.0f, false, false}, // 4 (TFT 5)
   {"Batterie",    "V",    0.f, -100.f, 11.5f,   15.3f, 10.f,   16.0f, false, true},  // 5 (TFT 6)
-  {"Oeltemp",     "C",    0.f, -100.f, -1.0f,  110.0f, 0.0f, 130.0f, false, true}   // 6 (BLE only)
+  {"Oeltemp",     "C",    0.f, -100.f, -1.0f,  110.0f, 0.0f, 130.0f, false, true}   // 6 (BLE / Datenpool)
 };
 
 struct PIDDef { uint8_t mode; uint16_t pid; uint32_t header; bool isExtended; };
 const PIDDef pidDefs[7] = {
   { 1, 0x05,   0x7DF, false}, // 0: Kühlwasser
   { 1, 0x0B,   0x7DF, false}, // 1: Ladedruck
-  {22, 0x2104, 0x7E1, false}, // 2: Getriebe
+  {22, 0x2104, 0x7E1, false}, // 2: Getriebe (UDS DSG)
   { 1, 0x0F,   0x7DF, false}, // 3: Ansaugtemp
   { 1, 0x2F,   0x7DF, false}, // 4: Tankinhalt
   { 1, 0x42,   0x7DF, false}, // 5: Batterie
-  { 1, 0x5C,   0x7DF, false}  // 6: Öltemperatur (Standard OBD-II PID 5C)
+  {22, 0x115C, 0x7E0, false}  // 6: Öltemperatur (UDS DAZA PID 115C)
 };
 
 bool btConnected = false, elmReady = false, needFullRedraw = true;
@@ -99,11 +99,13 @@ uint8_t hexByte(const char* s) {
   return v;
 }
 
-bool elmRawCmd(const char* cmd, uint16_t timeoutMs = 600) {
+bool elmRawCmd(const char* cmd, uint16_t timeoutMs = 500) {
   if (!SerialBT.connected()) return false;
   
   while (SerialBT.available()) SerialBT.read();
-  SerialBT.print(cmd); SerialBT.print("\r");
+  
+  SerialBT.print(cmd); 
+  SerialBT.print("\r");
   
   unsigned long start = millis();
   int idx = 0;
@@ -114,8 +116,13 @@ bool elmRawCmd(const char* cmd, uint16_t timeoutMs = 600) {
     
     if (SerialBT.available()) {
       char c = SerialBT.read();
-      if (c == '>') return (idx > 0);
-      if (idx < 126 && c >= ' ') rawBuf[idx++] = c;
+      if (c == '>') {
+        rawBuf[idx] = '\0';
+        return (idx > 0);
+      }
+      if (idx < 126 && c > ' ' && c != '\r' && c != '\n') {
+        rawBuf[idx++] = c;
+      }
     }
     yield();
   }
@@ -124,19 +131,19 @@ bool elmRawCmd(const char* cmd, uint16_t timeoutMs = 600) {
 
 bool initELM() {
   Serial.println("Initialisiere ELM327...");
-  delay(500);
+  delay(300);
   
-  if(!elmRawCmd("ATZ", 1500)) {
+  if(!elmRawCmd("ATZ", 1200)) {
     Serial.println("ATZ keine Antwort.");
     return false;
   }
-  delay(300);
+  delay(200);
   
-  elmRawCmd("ATE0", 300); 
-  elmRawCmd("ATS0", 300);
-  elmRawCmd("ATH1", 300); 
-  elmRawCmd("ATSP6", 300);
-  elmRawCmd("ATCAF1", 300); 
+  elmRawCmd("ATE0", 250); 
+  elmRawCmd("ATS0", 250);
+  elmRawCmd("ATH1", 250); 
+  elmRawCmd("ATSP6", 250);
+  elmRawCmd("ATCAF1", 250); 
   activeHeader = 0;
   Serial.println("ELM327 Bereit!");
   return true;
@@ -149,37 +156,43 @@ void queryGauge(uint8_t idx) {
   
   if (activeHeader != def.header) {
     snprintf(cmd, sizeof(cmd), "ATSH%03X", (uint16_t)def.header);
-    elmRawCmd(cmd, 200); 
+    elmRawCmd(cmd, 150); 
     activeHeader = def.header;
-    delay(20);
+    delay(15);
   }
 
   if (def.mode == 22 && (millis() - lastSessionKeepAlive > 2000)) {
-    elmRawCmd("1003", 250); 
+    elmRawCmd("1003", 200); 
     lastSessionKeepAlive = millis();
   }
 
-  if (def.mode == 1) snprintf(cmd, sizeof(cmd), "01%02X", (uint8_t)def.pid);
-  else               snprintf(cmd, sizeof(cmd), "22%04X", def.pid);
+  if (def.mode == 1) snprintf(cmd, sizeof(cmd), "01%02X1", (uint8_t)def.pid);
+  else               snprintf(cmd, sizeof(cmd), "22%04X1", def.pid);
 
-  if (!elmRawCmd(cmd, (idx <= 1 ? 800 : 350))) {
+  if (!elmRawCmd(cmd, (idx <= 1 ? 600 : 300))) {
     Serial.printf("[OBD TIMEOUT] Befehl: %s | Keine Antwort vom ELM327\n", cmd);
     return;
   }
   
+  // UDS NRC Filterung (7F2278 Response Pending überspringen)
+  char* parseSrc = rawBuf;
+  char* pending = strstr(rawBuf, "7F2278");
+  if (pending) {
+    parseSrc = pending + 6;
+  }
+
   char search[12];
   if (def.mode == 1) sprintf(search, "41%02X", (uint8_t)def.pid);
   else               sprintf(search, "62%04X", def.pid);
   
-  char* p = strstr(rawBuf, search);
-  if (!p && def.mode == 22) p = strstr(rawBuf, "62"); 
+  char* p = strstr(parseSrc, search);
+  if (!p && def.mode == 22) p = strstr(parseSrc, "62"); 
 
   if (p) {
     if (strstr(p, search)) p += strlen(search); else p += 2;
-    while(*p == ' ') p++;
     if (strlen(p) < 2) return;
 
-    if (idx == 0) { // Kuehlwasser
+    if (idx == 0) { // Kühlwasser
       gauges[idx].value = (float)hexByte(p) - 40.0f; 
     }
     else if (idx == 1) { // Ladedruck
@@ -192,15 +205,15 @@ void queryGauge(uint8_t idx) {
       gauges[idx].value = smoothedVolt;
     }
     else if (def.mode == 1) {
-      if (def.pid == 0x2F) gauges[idx].value = ((float)hexByte(p) * 100.0f / 255.0f) * 0.55f; // Tankinhalt
+      if (def.pid == 0x2F) gauges[idx].value = ((float)hexByte(p) * 100.0f / 255.0f) * 0.55f; // Tank
       else                 gauges[idx].value = (float)hexByte(p) - 40.0f; // Ansaugtemp
     }
-    else if (def.pid == 0x2104) { // Getriebe
+    else if (def.pid == 0x2104) { // Getriebe (DSG 7E1)
       gauges[idx].value = (float)hexByte(p); 
     }
-    else if (def.pid == 0x1121) { // Öltemperatur (VAG UDS 16-Bit: raw / 512.0)
+    else if (def.pid == 0x115C) { // Öltemperatur Motor ECU (UDS PID 115C, Offset -85.0f)
       uint16_t raw16 = ((uint16_t)hexByte(p) << 8) | hexByte(p + 2);
-      gauges[idx].value = (float)raw16 / 512.0f;
+      gauges[idx].value = ((float)raw16 / 100.0f) - 85.0f;
     }
     
     if (gauges[idx].trackMax) {
@@ -222,13 +235,13 @@ void sendBleJsonData() {
   char jsonBuffer[256];
   snprintf(jsonBuffer, sizeof(jsonBuffer),
            "{\"water\":%.1f,\"boost\":%.2f,\"gearTemp\":%.1f,\"intake\":%.1f,\"fuel\":%d,\"volt\":%.1f,\"oil\":%.1f}\n",
-           gauges[0].value,   // Kuehlwasser
-           gauges[1].value,   // Ladedruck
-           gauges[2].value,   // Getriebe
-           gauges[3].value,   // Ansaugtemp
-           (int)gauges[4].value, // Tankinhalt
-           gauges[5].value,   // Batterie
-           gauges[6].value    // Öltemp
+           gauges[0].value,
+           gauges[1].value,
+           gauges[2].value,
+           gauges[3].value,
+           (int)gauges[4].value,
+           gauges[5].value,
+           gauges[6].value
   );
 
   pCharacteristic->setValue(jsonBuffer);
@@ -335,10 +348,17 @@ void setupBLE() {
   pService->start();
 
   BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
+
+  BLEAdvertisementData advData;
+  advData.setFlags(0x06); 
+  advData.setCompleteServices(BLEUUID(SERVICE_UUID));
+  advData.setName("RS3-Dashboard-BLE");
+  pAdvertising->setAdvertisementData(advData);
+
   pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06);
-  pAdvertising->setMinPreferred(0x12);
+  pAdvertising->setMinInterval(0x20); // 20 ms
+  pAdvertising->setMaxInterval(0x40); // 40 ms
+  
   BLEDevice::startAdvertising();
   Serial.println("[BLE] Gestartet. Advertising aktiv...");
 }
@@ -362,7 +382,7 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // 1. OBD Bluetooth Verbindungsverwaltung
+  // 1. OBD Bluetooth Verbindung
   if (!SerialBT.connected()) {
     if (now - lastReconnect > 5000) {
       lastReconnect = now; 
@@ -384,11 +404,11 @@ void loop() {
     }
   }
 
-  // 2. BLE Reconnect Handling (Verbindungstrennung verarbeiten)
+  // 2. BLE Reconnect Handling
   if (!bleClientConnected && oldBleClientConnected) {
-    delay(500); // Bluetooth-Stack entlasten
+    delay(300);
     pServer->startAdvertising(); 
-    Serial.println("[BLE] Client getrennt -> Advertising sauber neu gestartet!");
+    Serial.println("[BLE] Client getrennt -> Advertising neu gestartet!");
     oldBleClientConnected = bleClientConnected;
   }
 
@@ -396,26 +416,36 @@ void loop() {
     oldBleClientConnected = bleClientConnected;
   }
 
-  // 3. OBD Werte abfragen (0 bis 6)
+  // 3. Dynamische OBD Abfrage
   if (elmReady) { 
-    queryGauge(currentGauge); 
-    currentGauge = (currentGauge + 1) % 7; 
+    uint32_t obdInterval = bleClientConnected ? 10 : 1500;
+    static uint32_t lastObdPoll = 0;
+
+    if (now - lastObdPoll >= obdInterval) {
+      lastObdPoll = now;
+      queryGauge(currentGauge); 
+      currentGauge = (currentGauge + 1) % 7; 
+      
+      if (!bleClientConnected) {
+        delay(60); 
+      }
+    }
   }
 
-  // 4. Display Refresh (Aktualisiert die 6 Kacheln auf dem TFT)
+  // 4. TFT Update
   if (now - lastRedraw > 300) { 
     lastRedraw = now; 
     drawDashboard(needFullRedraw); 
     needFullRedraw = false; 
   }
 
-  // 5. BLE Live-Daten an App senden
+  // 5. BLE Daten senden
   if (bleClientConnected && (now - lastBleNotify > 200)) {
     lastBleNotify = now;
     sendBleJsonData();
   }
 
-  // 6. Diagnostischer BLE Heartbeat im Serial Monitor (alle 5 Sekunden)
+  // 6. Diagnostischer Status
   if (now - lastBleStatusCheck > 5000) {
     lastBleStatusCheck = now;
     if (bleClientConnected) {
