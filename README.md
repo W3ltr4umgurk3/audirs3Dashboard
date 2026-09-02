@@ -28,6 +28,7 @@ BatteryVoltsOBDII (01)0x420x7DF (Broadcast)
 
 Microcontroller: ESP32 (e.g., DevKit V1)
 Display: TFT with ILI9341 or compatible controller (320x240 resolution), driven by the TFT_eSPI library.
+Touch: Capacitive I2C touch controller. Connect CTP_SDA to GPIO 21, CTP_SCL to GPIO 22, CTP_RST to GPIO 16, and CTP_INT to GPIO 27.
 OBD2 Adapter: ELM327 Bluetooth (v1.5 or v2.1 recommended).
 
 🔧 Software Setup
@@ -35,6 +36,9 @@ OBD2 Adapter: ELM327 Bluetooth (v1.5 or v2.1 recommended).
 Libraries:TFT_eSPI: Must be configured for your specific display pinout in User_Setup.h.BluetoothSerial: Included in the standard ESP32 Arduino core.
 Configuration:Enter the MAC address of your ELM327 adapter in the BT_MAC variable.
 Adjust warning thresholds in the gauges array as needed.
+The capacitive controller is read at I2C address `0x38`, which is used by FT6x06/FT6236-compatible controllers. No resistive-touch calibration or `TOUCH_CS` connection is required.
+
+The dashboard has three touch-selectable screens. Touch the left edge to move back and the right edge to move forward. Screen 1 is the existing six-gauge dashboard, screen 2 shows oil and transmission temperature as half-circle KPIs, and screen 3 is reserved for a future layout.
 
 📝 How the Parser Works
 

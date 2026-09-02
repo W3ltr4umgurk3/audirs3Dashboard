@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include <TFT_eSPI.h>
 #include "BluetoothSerial.h"
 #include <BLEDevice.h>
@@ -32,6 +33,8 @@ uint32_t lastBleStatusCheck = 0;
 #define ROWS        2
 #define TILE_W    (SCREEN_W / COLS)
 #define TILE_H    ((SCREEN_H - HEADER_H) / ROWS)
+#define SCREEN_COUNT 3
+#define CTP_I2C_ADDRESS 0x38
 
 struct Gauge {
   const char* label;
@@ -68,22 +71,38 @@ const PIDDef pidDefs[7] = {
   {22, 0x115C, 0x7E0, false}  // 6: Öltemperatur (UDS DAZA PID 115C)
 };
 
-bool btConnected = false, elmReady = false, needFullRedraw = true;
+bool btConnected = false, elmReady = false;
+volatile bool needFullRedraw = true;
 uint32_t lastReconnect = 0, lastRedraw = 0, lastSessionKeepAlive = 0, btConnectTime = 0;
 uint32_t activeHeader = 0x000;
 uint8_t currentGauge = 0;
+volatile uint8_t currentScreen = 0;
+bool touchWasPressed = false;
+bool touchGestureHandled = false;
+uint8_t touchStableSamples = 0;
+uint8_t touchReleaseSamples = 0;
+uint16_t touchStartX = 0;
+uint16_t touchStartY = 0;
+uint16_t touchLastX = 0;
+uint16_t touchLastY = 0;
+uint32_t lastTouchScan = 0;
+bool ctpReady = false;
+TaskHandle_t touchTaskHandle = NULL;
+SemaphoreHandle_t displayMutex = NULL;
 char rawBuf[128];
 float smoothedVolt = 0.0f;
+
+void updateTouch();
+void touchTask(void* parameter);
+void redrawFromTouch();
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
       bleClientConnected = true;
-      needFullRedraw = true;
       Serial.printf("[BLE] Client verbunden! Conn ID: %d\n", param->connect.conn_id);
     }
     void onDisconnect(BLEServer* pServer) override {
       bleClientConnected = false;
-      needFullRedraw = true;
       Serial.println("[BLE] Client getrennt!");
     }
 };
@@ -113,7 +132,7 @@ bool elmRawCmd(const char* cmd, uint16_t timeoutMs = 500) {
   
   while (millis() - start < timeoutMs) {
     if (!SerialBT.connected()) return false;
-    
+
     if (SerialBT.available()) {
       char c = SerialBT.read();
       if (c == '>') {
@@ -304,7 +323,7 @@ void drawTile(uint8_t i) {
   tileSpr.pushSprite(tx, ty);
 }
 
-void drawHeader() {
+void drawHeader(uint8_t screen) {
   tft.fillRect(0, 0, SCREEN_W, HEADER_H, TFT_BLACK);
   tft.setTextSize(1); 
   tft.setTextColor(TFT_WHITE);
@@ -320,15 +339,186 @@ void drawHeader() {
 
   tft.setTextColor(elmReady ? TFT_GREEN : TFT_RED);
   tft.drawString(elmReady ? "ELM:ON" : "ELM:OFF", rightX, 5);
+
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_WHITE);
+  char pageBuf[8];
+  snprintf(pageBuf, sizeof(pageBuf), "%d/3", screen + 1);
+  tft.drawString(pageBuf, SCREEN_W / 2, 5);
+}
+
+void drawHalfCircleKpi(uint16_t centerX, const Gauge& gauge, const char* title) {
+  const int16_t centerY = 155;
+  const int16_t radius = 65;
+  const float range = gauge.maxVal - gauge.minVal;
+  float percent = gauge.hasValue && range > 0.0f
+                    ? constrain((gauge.value - gauge.minVal) / range, 0.0f, 1.0f)
+                    : 0.0f;
+  uint16_t valueColor = (gauge.hasValue &&
+                         (gauge.value < gauge.warnLow || gauge.value > gauge.warnHigh))
+                          ? TFT_RED : TFT_GREEN;
+
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_YELLOW);
+  tft.drawString(title, centerX, 35);
+  tft.drawArc(centerX, centerY, radius, radius - 10, 90, 270, TFT_DARKGREY, TFT_BLACK);
+  if (percent > 0.0f) {
+    tft.drawArc(centerX, centerY, radius, radius - 10,
+                90, 90 + (uint16_t)(percent * 180.0f), valueColor, TFT_BLACK);
+  }
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(gauge.hasValue ? valueColor : TFT_DARKGREY);
+  tft.setTextSize(3);
+  if (gauge.hasValue) {
+    char valueBuf[12];
+    if (gauge.unit[0] == 'C') snprintf(valueBuf, sizeof(valueBuf), "%d", (int)roundf(gauge.value));
+    else dtostrf(gauge.value, 2, 1, valueBuf);
+    tft.drawString(valueBuf, centerX, centerY - 5);
+  } else {
+    tft.drawString("---", centerX, centerY - 5);
+  }
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_CYAN);
+  tft.drawString(gauge.unit, centerX, centerY + 23);
+}
+
+void drawKpiScreen() {
+  tft.fillScreen(TFT_BLACK);
+  drawHalfCircleKpi(82, gauges[6], "OELTEMP");
+  drawHalfCircleKpi(238, gauges[2], "GETRIEBE");
+  tft.setTextDatum(BC_DATUM);
+  tft.setTextColor(TFT_DARKGREY);
+  tft.drawString("Touch links/rechts zum Wechseln", SCREEN_W / 2, SCREEN_H - 3);
+}
+
+void drawFutureScreen() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_CYAN);
+  tft.setTextSize(2);
+  tft.drawString("SCREEN 3", SCREEN_W / 2, 100);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_DARKGREY);
+  tft.drawString("Noch nicht festgelegt", SCREEN_W / 2, 130);
+  tft.drawString("Touch links/rechts zum Wechseln", SCREEN_W / 2, SCREEN_H - 8);
 }
 
 void drawDashboard(bool full) {
-  if (full) {
-    tft.fillScreen(TFT_BLACK);
-    drawHeader();
+  uint8_t screen = currentScreen;
+  if (full) tft.fillScreen(TFT_BLACK);
+  if (screen == 0) {
+    if (full) drawHeader(screen);
+    for (uint8_t i = 0; i < 6; i++) drawTile(i);
+  } else if (screen == 1) {
+    drawKpiScreen();
+  } else {
+    drawFutureScreen();
   }
-  for (uint8_t i = 0; i < 6; i++) drawTile(i);
-  if (!full) drawHeader();
+  drawHeader(screen);
+}
+
+void redrawFromTouch() {
+  if (displayMutex != NULL && xSemaphoreTake(displayMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    drawDashboard(true);
+    needFullRedraw = false;
+    lastRedraw = millis();
+    xSemaphoreGive(displayMutex);
+  }
+}
+
+void updateTouch() {
+  if (!ctpReady) return;
+  if (millis() - lastTouchScan < 15) return;
+  lastTouchScan = millis();
+
+  Wire.beginTransmission(CTP_I2C_ADDRESS);
+  Wire.write(0x02); // Number of touch points (FT6x06/FT6236)
+  if (Wire.endTransmission(false) != 0 || Wire.requestFrom(CTP_I2C_ADDRESS, 5u) != 5u) {
+    touchGestureHandled = false;
+    return;
+  }
+
+  uint8_t touches = Wire.read() & 0x0F;
+  uint8_t xHigh = Wire.read();
+  uint8_t xLow = Wire.read();
+  uint8_t yHigh = Wire.read();
+  uint8_t yLow = Wire.read();
+  bool pressed = touches > 0;
+  uint16_t rawX = ((xHigh & 0x0F) << 8) | xLow;
+  uint16_t rawY = ((yHigh & 0x0F) << 8) | yLow;
+
+  // The panel reports portrait coordinates; rotation 3 is landscape 320x240.
+  uint16_t x = constrain(rawY, 0, SCREEN_W - 1);
+  uint16_t y = constrain((SCREEN_H - 1) - rawX, 0, SCREEN_H - 1);
+  if (pressed) {
+    touchReleaseSamples = 0;
+    if (!touchWasPressed) {
+      touchStartX = x;
+      touchStartY = y;
+      touchGestureHandled = false;
+      touchStableSamples = 1;
+    } else if (abs((int)x - (int)touchLastX) < 35 && abs((int)y - (int)touchLastY) < 35) {
+      touchStableSamples = min((uint8_t)3, (uint8_t)(touchStableSamples + 1));
+    } else {
+      touchStableSamples = 0;
+    }
+    touchLastX = x;
+    touchLastY = y;
+
+    int16_t deltaX = (int16_t)x - (int16_t)touchStartX;
+    int16_t deltaY = (int16_t)y - (int16_t)touchStartY;
+    if (!touchGestureHandled && touchStableSamples >= 1 && abs(deltaX) >= 35 && abs(deltaY) < 120) {
+      if (deltaX < 0) {
+        currentScreen = (currentScreen + SCREEN_COUNT - 1) % SCREEN_COUNT;
+      } else {
+        currentScreen = (currentScreen + 1) % SCREEN_COUNT;
+      }
+      touchGestureHandled = true;
+      needFullRedraw = true;
+      lastRedraw = 0;
+      Serial.printf("[TOUCH] Swipe erkannt, Screen %u\n", currentScreen + 1);
+      redrawFromTouch();
+    }
+  } else if (touchWasPressed) {
+    touchReleaseSamples = min((uint8_t)3, (uint8_t)(touchReleaseSamples + 1));
+    if (touchReleaseSamples < 2) return;
+  }
+
+  if (!pressed) {
+    touchGestureHandled = false;
+  }
+  touchWasPressed = pressed;
+}
+
+void touchTask(void* parameter) {
+  (void)parameter;
+  for (;;) {
+    updateTouch();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void setupTouch() {
+  pinMode(CTP_RST, OUTPUT);
+  digitalWrite(CTP_RST, LOW);
+  delay(10);
+  digitalWrite(CTP_RST, HIGH);
+  pinMode(CTP_INT, INPUT_PULLUP);
+  Wire.begin(CTP_SDA, CTP_SCL);
+  Wire.setClock(400000);
+
+  Wire.beginTransmission(CTP_I2C_ADDRESS);
+  if (Wire.endTransmission() == 0) {
+    ctpReady = true;
+    Serial.printf("Capacitive Touch bereit, I2C-Adresse 0x%02X.\n", CTP_I2C_ADDRESS);
+  } else {
+    Serial.println("Kein capacitive Touch-Controller auf I2C 0x38 gefunden.");
+    Serial.println("Pruefe CTP_SDA, CTP_SCL, CTP_RST, 3V3 und GND.");
+  }
+
+  xTaskCreatePinnedToCore(touchTask, "touch", 4096, NULL, 2, &touchTaskHandle, 0);
+  Serial.println("Touch-Abfrage laeuft unabhaengig von Bluetooth.");
 }
 
 void setupBLE() {
@@ -369,8 +559,9 @@ void setup() {
   tft.init(); 
   tft.setRotation(3); 
   tft.invertDisplay(true);
-
   tileSpr.createSprite(TILE_W, TILE_H);
+  displayMutex = xSemaphoreCreateMutex();
+  setupTouch();
   
   SerialBT.begin("RS3-Dashboard", true); 
   SerialBT.setPin(BT_PIN);
@@ -391,7 +582,6 @@ void loop() {
       Serial.println("Verbinde mit ELM327 BT...");
       SerialBT.connect(BT_MAC); 
       btConnectTime = millis();
-      needFullRedraw = true;
     }
   } else {
     if (!btConnected) {
@@ -400,7 +590,6 @@ void loop() {
     }
     if (!elmReady && (now - btConnectTime > 2000)) { 
       elmReady = initELM(); 
-      needFullRedraw = true; 
     }
   }
 
@@ -433,10 +622,14 @@ void loop() {
   }
 
   // 4. TFT Update
-  if (now - lastRedraw > 300) { 
-    lastRedraw = now; 
-    drawDashboard(needFullRedraw); 
-    needFullRedraw = false; 
+  if (needFullRedraw || now - lastRedraw > 300) {
+    bool fullRedraw = needFullRedraw;
+    needFullRedraw = false;
+    lastRedraw = now;
+    if (displayMutex != NULL && xSemaphoreTake(displayMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      drawDashboard(fullRedraw);
+      xSemaphoreGive(displayMutex);
+    }
   }
 
   // 5. BLE Daten senden

@@ -12,9 +12,9 @@
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug",
-            "executable": "C:/Users/elias/Documents/ESP32dashboard/audirs3Dashboard/.pio/build/esp32dev/firmware.elf",
+            "executable": "/var/home/elias/Documents/audirs3Dashboard/audirs3Dashboard/.pio/build/esp32dev/firmware.elf",
             "projectEnvName": "esp32dev",
-            "toolchainBinDir": "C:/Users/elias/.platformio/packages/toolchain-xtensa-esp32/bin",
+            "toolchainBinDir": "/home/elias/.platformio/packages/toolchain-xtensa-esp32/bin",
             "internalConsoleOptions": "openOnSessionStart",
             "preLaunchTask": {
                 "type": "PlatformIO",
@@ -25,18 +25,18 @@
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug (skip Pre-Debug)",
-            "executable": "C:/Users/elias/Documents/ESP32dashboard/audirs3Dashboard/.pio/build/esp32dev/firmware.elf",
+            "executable": "/var/home/elias/Documents/audirs3Dashboard/audirs3Dashboard/.pio/build/esp32dev/firmware.elf",
             "projectEnvName": "esp32dev",
-            "toolchainBinDir": "C:/Users/elias/.platformio/packages/toolchain-xtensa-esp32/bin",
+            "toolchainBinDir": "/home/elias/.platformio/packages/toolchain-xtensa-esp32/bin",
             "internalConsoleOptions": "openOnSessionStart"
         },
         {
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug (without uploading)",
-            "executable": "C:/Users/elias/Documents/ESP32dashboard/audirs3Dashboard/.pio/build/esp32dev/firmware.elf",
+            "executable": "/var/home/elias/Documents/audirs3Dashboard/audirs3Dashboard/.pio/build/esp32dev/firmware.elf",
             "projectEnvName": "esp32dev",
-            "toolchainBinDir": "C:/Users/elias/.platformio/packages/toolchain-xtensa-esp32/bin",
+            "toolchainBinDir": "/home/elias/.platformio/packages/toolchain-xtensa-esp32/bin",
             "internalConsoleOptions": "openOnSessionStart",
             "loadMode": "manual"
         }
