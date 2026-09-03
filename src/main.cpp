@@ -51,13 +51,13 @@ struct Gauge {
 
 // 7 Gauges: Indices 0..5 TFT, Index 6 BLE (Hintergrund)
 Gauge gauges[7] = {
-  {"Kuehlwasser", "C",    0.f, -100.f, -1.0f,  105.0f, 0.0f, 120.0f, false, true},  // 0 (TFT 1)
+  {"Kuehlwasser", "C",    0.f, -100.f, 70.0f,  105.0f, 0.0f, 120.0f, false, true},  // 0 (TFT 1)
   {"Ladedruck",   "bar",  0.f, -100.f, -0.9f,    1.5f, -1.0f,   2.0f, false, true},  // 1 (TFT 2)
-  {"Getriebe",    "C",    0.f, -100.f, 20.0f,  110.0f, 0.f,   130.0f, false, true},  // 2 (TFT 3)
+  {"Getriebe",    "C",    0.f, -100.f, 60.0f,  110.0f, 0.f,   130.0f, false, true},  // 2 (TFT 3)
   {"Ansaugtemp",  "C",    0.f, -100.f, -20.f,   60.0f, -20.f,  80.0f, false, true},  // 3 (TFT 4)
-  {"Tankinhalt",  "L",    0.f, -100.f,  5.0f,   60.0f,  0.f,   60.0f, false, false}, // 4 (TFT 5)
-  {"Batterie",    "V",    0.f, -100.f, 11.5f,   15.3f, 10.f,   16.0f, false, true},  // 5 (TFT 6)
-  {"Oeltemp",     "C",    0.f, -100.f, -1.0f,  110.0f, 0.0f, 130.0f, false, true}   // 6 (BLE / Datenpool)
+  {"Tankinhalt",  "L",    0.f, -100.f, 10.0f,   60.0f,  0.f,   60.0f, false, false}, // 4 (TFT 5)
+  {"Batterie",    "V",    0.f, -100.f, 11.7f,   15.3f, 10.f,   16.0f, false, true},  // 5 (TFT 6)
+  {"Oeltemp",     "C",    0.f, -100.f, 80.0f,  110.0f, 0.0f, 130.0f, false, true}   // 6 (BLE / Datenpool)
 };
 
 struct PIDDef { uint8_t mode; uint16_t pid; uint32_t header; bool isExtended; };
