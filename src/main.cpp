@@ -51,7 +51,7 @@ struct Gauge {
 
 // 7 Gauges: Indices 0..5 TFT, Index 6 BLE (Hintergrund)
 Gauge gauges[7] = {
-  {"Kuehlwasser", "C",    0.f, -100.f, 70.0f,  105.0f, 0.0f, 120.0f, false, true},  // 0 (TFT 1)
+  {"Oeldruck",    "bar",  0.f, -100.f, 0.0f,     8.0f, 0.0f,  10.0f, false, true},  // 0 (TFT 1)
   {"Ladedruck",   "bar",  0.f, -100.f, -0.9f,    1.5f, -1.0f,   2.0f, false, true},  // 1 (TFT 2)
   {"Getriebe",    "C",    0.f, -100.f, 60.0f,  110.0f, 0.f,   130.0f, false, true},  // 2 (TFT 3)
   {"Ansaugtemp",  "C",    0.f, -100.f, -20.f,   60.0f, -20.f,  80.0f, false, true},  // 3 (TFT 4)
@@ -62,7 +62,7 @@ Gauge gauges[7] = {
 
 struct PIDDef { uint8_t mode; uint16_t pid; uint32_t header; bool isExtended; };
 const PIDDef pidDefs[7] = {
-  { 1, 0x05,   0x7DF, false}, // 0: Kühlwasser
+  {22, 0x13F4, 0x7E0, false}, // 0: Oeldruck (UDS DAZA, candidate DID)
   { 1, 0x0B,   0x7DF, false}, // 1: Ladedruck
   {22, 0x2104, 0x7E1, false}, // 2: Getriebe (UDS DSG)
   { 1, 0x0F,   0x7DF, false}, // 3: Ansaugtemp
@@ -185,8 +185,8 @@ void queryGauge(uint8_t idx) {
     lastSessionKeepAlive = millis();
   }
 
-  if (def.mode == 1) snprintf(cmd, sizeof(cmd), "01%02X1", (uint8_t)def.pid);
-  else               snprintf(cmd, sizeof(cmd), "22%04X1", def.pid);
+  if (def.mode == 1) snprintf(cmd, sizeof(cmd), "01%02X", (uint8_t)def.pid);
+  else               snprintf(cmd, sizeof(cmd), "22%04X", def.pid);
 
   if (!elmRawCmd(cmd, (idx <= 1 ? 600 : 300))) {
     Serial.printf("[OBD TIMEOUT] Befehl: %s | Keine Antwort vom ELM327\n", cmd);
@@ -211,8 +211,11 @@ void queryGauge(uint8_t idx) {
     if (strstr(p, search)) p += strlen(search); else p += 2;
     if (strlen(p) < 2) return;
 
-    if (idx == 0) { // Kühlwasser
-      gauges[idx].value = (float)hexByte(p) - 40.0f; 
+    if (idx == 0 && def.pid == 0x13F4) { // Oeldruck, raw response needs vehicle verification
+      uint16_t raw16 = ((uint16_t)hexByte(p) << 8) | hexByte(p + 2);
+      gauges[idx].value = (float)raw16 / 100.0f;
+      Serial.printf("[OIL PRESSURE RAW] DID 13F4: %04X -> %.2f bar (scaling candidate)\n",
+                    raw16, gauges[idx].value);
     }
     else if (idx == 1) { // Ladedruck
       float absBar = (float)hexByte(p) / 100.0f;
@@ -287,7 +290,7 @@ void drawTile(uint8_t i) {
     tileSpr.setTextDatum(TR_DATUM); 
     tileSpr.setTextColor(TFT_CYAN);
     char mBuf[10];
-    if (i == 5 || i == 4 || i == 1) dtostrf(g.maxValue, 2, 1, mBuf); 
+    if (i == 5 || i == 4 || i == 1 || i == 0) dtostrf(g.maxValue, 2, 1, mBuf); 
     else snprintf(mBuf, sizeof(mBuf), "M:%d", (int)roundf(g.maxValue));
     tileSpr.drawString(mBuf, TILE_W - 5, 7);
   }
@@ -296,7 +299,7 @@ void drawTile(uint8_t i) {
   uint16_t vCol = TFT_WHITE;
   if (g.hasValue) {
     char buf[12];
-    if (i == 5 || i == 4 || i == 1) dtostrf(g.value, 2, 1, buf); 
+    if (i == 5 || i == 4 || i == 1 || i == 0) dtostrf(g.value, 2, 1, buf); 
     else snprintf(buf, sizeof(buf), "%d", (int)roundf(g.value));
     
     if (g.value < g.warnLow || g.value > g.warnHigh) vCol = TFT_RED;
@@ -383,8 +386,12 @@ void drawHalfCircleKpi(uint16_t centerX, const Gauge& gauge, const char* title) 
   tft.drawString(gauge.unit, centerX, centerY + 23);
 }
 
-void drawKpiScreen() {
-  tft.fillScreen(TFT_BLACK);
+void drawKpiScreen(bool clearScreen) {
+  if (clearScreen) tft.fillScreen(TFT_BLACK);
+  else {
+    tft.fillRect(5, 25, 155, 170, TFT_BLACK);
+    tft.fillRect(160, 25, 155, 170, TFT_BLACK);
+  }
   drawHalfCircleKpi(82, gauges[6], "OELTEMP");
   drawHalfCircleKpi(238, gauges[2], "GETRIEBE");
   tft.setTextDatum(BC_DATUM);
@@ -392,8 +399,8 @@ void drawKpiScreen() {
   tft.drawString("Touch links/rechts zum Wechseln", SCREEN_W / 2, SCREEN_H - 3);
 }
 
-void drawFutureScreen() {
-  tft.fillScreen(TFT_BLACK);
+void drawFutureScreen(bool clearScreen) {
+  if (clearScreen) tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(TFT_CYAN);
   tft.setTextSize(2);
@@ -411,9 +418,9 @@ void drawDashboard(bool full) {
     if (full) drawHeader(screen);
     for (uint8_t i = 0; i < 6; i++) drawTile(i);
   } else if (screen == 1) {
-    drawKpiScreen();
+    drawKpiScreen(full);
   } else {
-    drawFutureScreen();
+    drawFutureScreen(full);
   }
   drawHeader(screen);
 }
@@ -612,6 +619,9 @@ void loop() {
 
     if (now - lastObdPoll >= obdInterval) {
       lastObdPoll = now;
+      if (currentScreen == 1 && currentGauge != 2 && currentGauge != 6) {
+        currentGauge = (currentGauge == 0) ? 2 : 6;
+      }
       queryGauge(currentGauge); 
       currentGauge = (currentGauge + 1) % 7; 
       
