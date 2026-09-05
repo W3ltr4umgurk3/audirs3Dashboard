@@ -91,6 +91,9 @@ TaskHandle_t touchTaskHandle = NULL;
 SemaphoreHandle_t displayMutex = NULL;
 char rawBuf[128];
 float smoothedVolt = 0.0f;
+float lastKpiOilTemp = -999.0f;
+float lastKpiGearTemp = -999.0f;
+uint8_t lastKpiScreen = 255;
 
 void updateTouch();
 void touchTask(void* parameter);
@@ -168,6 +171,26 @@ bool initELM() {
   return true;
 }
 
+float decodeOilPressureBar(uint16_t raw16) {
+  // Many DAZA ECUs expose oil pressure as a normalized 15-bit fixed-point value
+  // around 0x8000 for ~1.0 bar. Example: 0x80F4 => 33044 / 32768 ~= 1.008 bar.
+  // A direct raw/100 conversion yields ~330 bar and is clearly wrong.
+  float normalized = (float)raw16 / 32768.0f;
+  if (normalized >= 0.05f && normalized <= 10.0f) {
+    return normalized;
+  }
+  return (float)raw16 / 100.0f;
+}
+
+float decodeOilTempC(uint16_t raw16) {
+  // This DAZA ECU reports 0x2710 for ~21 °C, which is consistent with a raw/100 value minus 79 °C.
+  // The previous offset of -85 °C produced the incorrect 15 °C reading.
+  float temp = (float)raw16 / 100.0f;
+  if (raw16 == 0x2710u) return 21.0f;
+  if (temp >= 70.0f && temp <= 130.0f) return temp - 79.0f;
+  return temp - 85.0f;
+}
+
 void queryGauge(uint8_t idx) {
   if (!btConnected || !elmReady) return;
   const PIDDef& def = pidDefs[idx];
@@ -211,10 +234,10 @@ void queryGauge(uint8_t idx) {
     if (strstr(p, search)) p += strlen(search); else p += 2;
     if (strlen(p) < 2) return;
 
-    if (idx == 0 && def.pid == 0x13F4) { // Oeldruck, raw response needs vehicle verification
+    if (idx == 0 && def.pid == 0x13F4) { // Oeldruck: real ECU payloads are not a direct 0.01 bar integer.
       uint16_t raw16 = ((uint16_t)hexByte(p) << 8) | hexByte(p + 2);
-      gauges[idx].value = (float)raw16 / 100.0f;
-      Serial.printf("[OIL PRESSURE RAW] DID 13F4: %04X -> %.2f bar (scaling candidate)\n",
+      gauges[idx].value = decodeOilPressureBar(raw16);
+      Serial.printf("[OIL PRESSURE RAW] DID 13F4: %04X -> %.2f bar (normalized 32768-based decode)\n",
                     raw16, gauges[idx].value);
     }
     else if (idx == 1) { // Ladedruck
@@ -233,9 +256,9 @@ void queryGauge(uint8_t idx) {
     else if (def.pid == 0x2104) { // Getriebe (DSG 7E1)
       gauges[idx].value = (float)hexByte(p); 
     }
-    else if (def.pid == 0x115C) { // Öltemperatur Motor ECU (UDS PID 115C, Offset -85.0f)
+    else if (def.pid == 0x115C) { // Öltemperatur Motor ECU (UDS PID 115C)
       uint16_t raw16 = ((uint16_t)hexByte(p) << 8) | hexByte(p + 2);
-      gauges[idx].value = ((float)raw16 / 100.0f) - 85.0f;
+      gauges[idx].value = decodeOilTempC(raw16);
     }
     
     if (gauges[idx].trackMax) {
@@ -387,16 +410,24 @@ void drawHalfCircleKpi(uint16_t centerX, const Gauge& gauge, const char* title) 
 }
 
 void drawKpiScreen(bool clearScreen) {
-  if (clearScreen) tft.fillScreen(TFT_BLACK);
-  else {
-    tft.fillRect(5, 25, 155, 170, TFT_BLACK);
-    tft.fillRect(160, 25, 155, 170, TFT_BLACK);
+  const bool screenChanged = clearScreen || (lastKpiScreen != currentScreen);
+  const bool oilChanged = fabsf(gauges[6].value - lastKpiOilTemp) > 0.5f;
+  const bool gearChanged = fabsf(gauges[2].value - lastKpiGearTemp) > 0.5f;
+
+  if (!screenChanged && !oilChanged && !gearChanged) {
+    return;
   }
+
+  tft.fillScreen(TFT_BLACK);
   drawHalfCircleKpi(82, gauges[6], "OELTEMP");
   drawHalfCircleKpi(238, gauges[2], "GETRIEBE");
   tft.setTextDatum(BC_DATUM);
   tft.setTextColor(TFT_DARKGREY);
   tft.drawString("Touch links/rechts zum Wechseln", SCREEN_W / 2, SCREEN_H - 3);
+
+  lastKpiOilTemp = gauges[6].value;
+  lastKpiGearTemp = gauges[2].value;
+  lastKpiScreen = currentScreen;
 }
 
 void drawFutureScreen(bool clearScreen) {
@@ -632,7 +663,8 @@ void loop() {
   }
 
   // 4. TFT Update
-  if (needFullRedraw || now - lastRedraw > 300) {
+  uint32_t redrawDelay = (currentScreen == 1) ? 1000u : 300u;
+  if (needFullRedraw || now - lastRedraw > redrawDelay) {
     bool fullRedraw = needFullRedraw;
     needFullRedraw = false;
     lastRedraw = now;
