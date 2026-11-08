@@ -80,7 +80,8 @@ const PIDDef pidDefs[7] = {
 
 // Werte, die laenger als STALE_MS nicht aktualisiert wurden, gelten als ungueltig ("---").
 #define STALE_MS 6000
-#define BLE_NOTIFY_MIN_MS 100    // max. 10 Pakete/s bei neuen Daten
+#define OBD_RETRY_GAP_MS  3000   // Pause zwischen zwei OBD-Verbindungsversuchen (Zeitfenster fuer BLE)
+#define BLE_NOTIFY_MIN_MS 100   // max. 10 Pakete/s bei neuen Daten
 #define BLE_HEARTBEAT_MS  1000   // Lebenszeichen auch ohne neue Daten
 #define PACKET_VERSION    0x01
 #define GAUGE_COUNT       7
@@ -363,9 +364,12 @@ void obdTask(void* parameter) {
       activeHeader = 0;
       dataDirty = true;
       Serial.println("Verbinde mit ELM327 BT...");
-      SerialBT.connect(BT_MAC);            // blockiert mehrere Sekunden - hier unkritisch
+      SerialBT.connect(BT_MAC);            // blockiert mehrere Sekunden (Paging belegt das gemeinsame Funkmodul)
       if (!SerialBT.connected()) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        // OBD hat Vorrang: es wird dauerhaft erneut gepaged. In dieser Luecke ist das Funkmodul
+        // aber frei, damit die App per BLE (Advertising alle 20-40 ms) verbinden kann.
+        // Ist die BLE-Verbindung einmal aufgebaut, laeuft sie dank 4 s Supervision-Timeout weiter.
+        vTaskDelay(pdMS_TO_TICKS(OBD_RETRY_GAP_MS));
         continue;
       }
     }
