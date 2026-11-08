@@ -21,10 +21,8 @@ BluetoothSerial SerialBT;
 
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
-bool bleClientConnected = false;
-bool oldBleClientConnected = false;
+volatile bool bleClientConnected = false;
 uint32_t lastBleNotify = 0;
-uint32_t lastBleStatusCheck = 0;
 
 #define SCREEN_W  320
 #define SCREEN_H  240
@@ -46,7 +44,8 @@ struct Gauge {
   float  minVal;
   float  maxVal;
   bool   hasValue;
-  bool   trackMax; 
+  bool   trackMax;
+  uint32_t lastUpdate;      // (wird mit 0 initialisiert) millis() der letzten gueltigen Messung
 };
 
 // 7 Gauges: Indices 0..5 TFT, Index 6 BLE (Hintergrund)
@@ -71,12 +70,50 @@ const PIDDef pidDefs[7] = {
   {22, 0x115C, 0x7E0, false}  // 6: Öltemperatur (UDS DAZA PID 115C)
 };
 
-bool btConnected = false, elmReady = false;
+// Debug-Ausgaben der OBD-/BLE-Daten (Serial.printf blockiert ~10 ms pro Zeile).
+#define DEBUG_DATA 0
+#if DEBUG_DATA
+  #define DBG(...) Serial.printf(__VA_ARGS__)
+#else
+  #define DBG(...) do {} while (0)
+#endif
+
+// Werte, die laenger als STALE_MS nicht aktualisiert wurden, gelten als ungueltig ("---").
+#define STALE_MS 6000
+#define BLE_NOTIFY_MIN_MS 100    // max. 10 Pakete/s bei neuen Daten
+#define BLE_HEARTBEAT_MS  1000   // Lebenszeichen auch ohne neue Daten
+#define PACKET_VERSION    0x01
+#define GAUGE_COUNT       7
+
+// Binaeres BLE-Paket (little endian, 18 Byte -> passt auch in die Default-MTU von 23).
+// v[i] = Wert von Gauge i * 100 (int16), Reihenfolge wie in gauges[].
+// validMask: Bit i gesetzt = Gauge i hat einen aktuellen Wert.
+// status: Bit0 = ELM bereit, Bit1 = OBD-Bluetooth verbunden.
+struct __attribute__((packed)) BlePacket {
+  uint8_t version;
+  uint8_t seq;
+  uint8_t validMask;
+  uint8_t status;
+  int16_t v[GAUGE_COUNT];
+};
+static_assert(sizeof(BlePacket) == 18, "BlePacket muss 18 Byte gross sein");
+
+// Abfrage-Reihenfolge nach Header gruppiert (7DF -> 7E0 -> 7E1), damit weniger ATSH noetig sind.
+// "schnell" = jeder Zyklus, "langsam" = nur jeder SLOW_EVERY-te Zyklus (aendert sich kaum).
+#define SLOW_EVERY 5
+const uint8_t pollOrder[GAUGE_COUNT] = {1, 3, 4, 5, 0, 6, 2};
+const bool    pollSlow[GAUGE_COUNT]  = {false, false, false, true, true, true, false};
+
+volatile bool btConnected = false, elmReady = false;
+volatile bool dataDirty = false;
 volatile bool needFullRedraw = true;
-uint32_t lastReconnect = 0, lastRedraw = 0, lastSessionKeepAlive = 0, btConnectTime = 0;
+bool useRespCount = true;     // ELM-Antwortanzahl anhaengen ("010B1"); wird bei "?" automatisch abgeschaltet
+uint8_t blePacketSeq = 0;
+uint32_t lastRedraw = 0, lastSessionKeepAlive = 0, btConnectTime = 0;
+volatile uint32_t bleDisconnectedAt = 0;
 uint32_t activeHeader = 0x000;
-uint8_t currentGauge = 0;
 volatile uint8_t currentScreen = 0;
+TaskHandle_t obdTaskHandle = NULL;
 bool touchWasPressed = false;
 bool touchGestureHandled = false;
 uint8_t touchStableSamples = 0;
@@ -93,6 +130,8 @@ char rawBuf[128];
 float smoothedVolt = 0.0f;
 float lastKpiOilTemp = -999.0f;
 float lastKpiGearTemp = -999.0f;
+bool lastKpiOilValid = false;
+bool lastKpiGearValid = false;
 uint8_t lastKpiScreen = 255;
 
 void updateTouch();
@@ -102,10 +141,17 @@ void redrawFromTouch();
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
       bleClientConnected = true;
+      bleDisconnectedAt = 0;
+      dataDirty = true;
+      // Verbindungsparameter: 30-60 ms Intervall, kein Slave-Latency, 4 s Supervision-Timeout.
+      // Schnell genug fuer ~10 Hz Daten, aber deutlich stromsparender als der Android-Default
+      // und robust gegen kurze Funkaussetzer im Hintergrundbetrieb.
+      pServer->updateConnParams(param->connect.remote_bda, 0x18, 0x30, 0, 400);
       Serial.printf("[BLE] Client verbunden! Conn ID: %d\n", param->connect.conn_id);
     }
     void onDisconnect(BLEServer* pServer) override {
       bleClientConnected = false;
+      bleDisconnectedAt = millis();
       Serial.println("[BLE] Client getrennt!");
     }
 };
@@ -145,23 +191,26 @@ bool elmRawCmd(const char* cmd, uint16_t timeoutMs = 500) {
       if (idx < 126 && c > ' ' && c != '\r' && c != '\n') {
         rawBuf[idx++] = c;
       }
+    } else {
+      vTaskDelay(1);   // Task abgeben statt busy-wait, solange der ELM noch nicht antwortet
     }
-    yield();
   }
   return false;
 }
 
 bool initELM() {
   Serial.println("Initialisiere ELM327...");
-  delay(300);
-  
+  vTaskDelay(pdMS_TO_TICKS(300));
+
   if(!elmRawCmd("ATZ", 1200)) {
     Serial.println("ATZ keine Antwort.");
     return false;
   }
-  delay(200);
-  
-  elmRawCmd("ATE0", 250); 
+  vTaskDelay(pdMS_TO_TICKS(200));
+
+  elmRawCmd("ATE0", 250);
+  elmRawCmd("ATL0", 250);   // keine Linefeeds -> weniger Bytes pro Antwort
+  elmRawCmd("ATAT1", 250);  // adaptives Timing: ELM wartet nur so lange wie das Steuergeraet braucht
   elmRawCmd("ATS0", 250);
   elmRawCmd("ATH1", 250); 
   elmRawCmd("ATSP6", 250);
@@ -191,29 +240,40 @@ float decodeOilTempC(uint16_t raw16) {
   return temp - 85.0f;
 }
 
-void queryGauge(uint8_t idx) {
-  if (!btConnected || !elmReady) return;
+// Liefert true, wenn eine auswertbare Antwort kam (Timeout/Parsefehler = false).
+bool queryGauge(uint8_t idx) {
+  if (!btConnected || !elmReady) return false;
   const PIDDef& def = pidDefs[idx];
   char cmd[32];
-  
+
   if (activeHeader != def.header) {
     snprintf(cmd, sizeof(cmd), "ATSH%03X", (uint16_t)def.header);
-    elmRawCmd(cmd, 150); 
+    elmRawCmd(cmd, 150);
     activeHeader = def.header;
-    delay(15);
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 
   if (def.mode == 22 && (millis() - lastSessionKeepAlive > 2000)) {
-    elmRawCmd("1003", 200); 
+    elmRawCmd("1003", 200);
     lastSessionKeepAlive = millis();
   }
 
-  if (def.mode == 1) snprintf(cmd, sizeof(cmd), "01%02X", (uint8_t)def.pid);
-  else               snprintf(cmd, sizeof(cmd), "22%04X", def.pid);
+  // Angehaengte "1" = "genau 1 Antwort erwartet": der ELM antwortet sofort nach der ersten
+  // Antwort, statt seinen vollen Timeout abzuwarten. Wird der Befehl mit "?" quittiert
+  // (aeltere Klone), schalten wir das Feature ab und senden ohne Suffix.
+  const char* suffix = useRespCount ? "1" : "";
+  if (def.mode == 1) snprintf(cmd, sizeof(cmd), "01%02X%s", (uint8_t)def.pid, suffix);
+  else               snprintf(cmd, sizeof(cmd), "22%04X%s", def.pid, suffix);
 
   if (!elmRawCmd(cmd, (idx <= 1 ? 600 : 300))) {
-    Serial.printf("[OBD TIMEOUT] Befehl: %s | Keine Antwort vom ELM327\n", cmd);
-    return;
+    DBG("[OBD TIMEOUT] Befehl: %s | Keine Antwort vom ELM327\n", cmd);
+    return false;
+  }
+
+  if (useRespCount && strchr(rawBuf, '?')) {
+    useRespCount = false;
+    Serial.println("[OBD] ELM kennt Antwortanzahl-Suffix nicht -> deaktiviert");
+    return false;
   }
   
   // UDS NRC Filterung (7F2278 Response Pending überspringen)
@@ -232,13 +292,13 @@ void queryGauge(uint8_t idx) {
 
   if (p) {
     if (strstr(p, search)) p += strlen(search); else p += 2;
-    if (strlen(p) < 2) return;
+    if (strlen(p) < 2) return false;
 
     if (idx == 0 && def.pid == 0x13F4) { // Oeldruck: real ECU payloads are not a direct 0.01 bar integer.
       uint16_t raw16 = ((uint16_t)hexByte(p) << 8) | hexByte(p + 2);
       gauges[idx].value = decodeOilPressureBar(raw16);
-      Serial.printf("[OIL PRESSURE RAW] DID 13F4: %04X -> %.2f bar (normalized 32768-based decode)\n",
-                    raw16, gauges[idx].value);
+      DBG("[OIL PRESSURE RAW] DID 13F4: %04X -> %.2f bar (normalized 32768-based decode)\n",
+          raw16, gauges[idx].value);
     }
     else if (idx == 1) { // Ladedruck
       float absBar = (float)hexByte(p) / 100.0f;
@@ -265,37 +325,133 @@ void queryGauge(uint8_t idx) {
       if (gauges[idx].value > gauges[idx].maxValue) gauges[idx].maxValue = gauges[idx].value;
     }
     gauges[idx].hasValue = true;
+    gauges[idx].lastUpdate = millis();
+    dataDirty = true;
 
-    Serial.printf("[OBD RX] %-11s | Raw: %-20s | Wert: %.1f %s\n", 
-                  gauges[idx].label, rawBuf, gauges[idx].value, gauges[idx].unit);
-  } else {
-    Serial.printf("[OBD PARSE ERR] %-11s | Match '%s' nicht in Raw '%s' gefunden\n", 
-                  gauges[idx].label, search, rawBuf);
+    DBG("[OBD RX] %-11s | Raw: %-20s | Wert: %.1f %s\n",
+        gauges[idx].label, rawBuf, gauges[idx].value, gauges[idx].unit);
+    return true;
+  }
+
+  DBG("[OBD PARSE ERR] %-11s | Match '%s' nicht in Raw '%s' gefunden\n",
+      gauges[idx].label, search, rawBuf);
+  return false;
+}
+
+// Werte ohne frische Messung ausblenden, damit App und Display nie "eingefrorene" Zahlen als live zeigen.
+void expireStaleGauges(uint32_t now) {
+  for (uint8_t i = 0; i < GAUGE_COUNT; i++) {
+    if (gauges[i].hasValue && (now - gauges[i].lastUpdate) > STALE_MS) {
+      gauges[i].hasValue = false;
+      dataDirty = true;
+    }
   }
 }
 
-void sendBleJsonData() {
+// OBD-Task: haelt die Bluetooth-Classic-Verbindung zum ELM327 und fragt alle Werte zyklisch ab.
+// Laeuft komplett getrennt von Display und BLE, damit blockierende Aufrufe (connect, Timeouts)
+// weder die Anzeige noch die App-Benachrichtigungen aufhalten.
+void obdTask(void* parameter) {
+  (void)parameter;
+  uint32_t cycle = 0;
+  uint8_t failStreak = 0;
+
+  for (;;) {
+    if (!SerialBT.connected()) {
+      btConnected = false;
+      elmReady = false;
+      activeHeader = 0;
+      dataDirty = true;
+      Serial.println("Verbinde mit ELM327 BT...");
+      SerialBT.connect(BT_MAC);            // blockiert mehrere Sekunden - hier unkritisch
+      if (!SerialBT.connected()) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        continue;
+      }
+    }
+
+    if (!btConnected) {
+      btConnected = true;
+      btConnectTime = millis();
+      dataDirty = true;
+    }
+
+    if (!elmReady) {
+      uint32_t sinceConnect = millis() - btConnectTime;
+      if (sinceConnect < 2000) vTaskDelay(pdMS_TO_TICKS(2000 - sinceConnect));
+      elmReady = initELM();
+      failStreak = 0;
+      dataDirty = true;
+      if (!elmReady) vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    bool includeSlow = (cycle % SLOW_EVERY) == 0;
+    bool screenKpiOnly = (currentScreen == 1) && !bleClientConnected;   // nur Oeltemp + Getriebe noetig
+    for (uint8_t n = 0; n < GAUGE_COUNT && elmReady; n++) {
+      uint8_t idx = pollOrder[n];
+      if (pollSlow[idx] && !includeSlow) continue;
+      if (screenKpiOnly && idx != 2 && idx != 6) continue;
+
+      if (queryGauge(idx)) {
+        failStreak = 0;
+      } else if (++failStreak >= 12) {      // ELM antwortet gar nicht mehr -> neu initialisieren
+        Serial.println("[OBD] Zu viele Fehler in Folge -> ELM neu initialisieren");
+        elmReady = false;
+        break;
+      }
+      if (!SerialBT.connected()) break;
+      vTaskDelay(bleClientConnected ? 1 : pdMS_TO_TICKS(20));
+    }
+    cycle++;
+    vTaskDelay(1);
+  }
+}
+
+static int16_t toFixed100(float x) {
+  float v = x * 100.0f;
+  if (v > 32767.0f) v = 32767.0f;
+  if (v < -32768.0f) v = -32768.0f;
+  return (int16_t)lroundf(v);
+}
+
+void sendBleData() {
   if (!bleClientConnected) return;
 
-  char jsonBuffer[256];
-  snprintf(jsonBuffer, sizeof(jsonBuffer),
-           "{\"water\":%.1f,\"boost\":%.2f,\"gearTemp\":%.1f,\"intake\":%.1f,\"fuel\":%d,\"volt\":%.1f,\"oil\":%.1f}\n",
-           gauges[0].value,
-           gauges[1].value,
-           gauges[2].value,
-           gauges[3].value,
-           (int)gauges[4].value,
-           gauges[5].value,
-           gauges[6].value
-  );
+  BlePacket pkt;
+  pkt.version = PACKET_VERSION;
+  pkt.seq = blePacketSeq++;
+  pkt.validMask = 0;
+  pkt.status = (elmReady ? 0x01 : 0) | (btConnected ? 0x02 : 0);
+  for (uint8_t i = 0; i < GAUGE_COUNT; i++) {
+    bool ok = gauges[i].hasValue;
+    if (ok) pkt.validMask |= (1 << i);
+    pkt.v[i] = ok ? toFixed100(gauges[i].value) : 0;
+  }
 
-  pCharacteristic->setValue(jsonBuffer);
+  pCharacteristic->setValue((uint8_t*)&pkt, sizeof(pkt));
   pCharacteristic->notify();
 
-  Serial.printf("[BLE TX] %s", jsonBuffer);
+  DBG("[BLE TX] seq=%u mask=%02X\n", pkt.seq, pkt.validMask);
+}
+
+// Zuletzt gezeichneter Zustand pro Kachel / Header: gezeichnet wird nur, was sich geaendert hat.
+struct TileCache { float value; float maxValue; bool hasValue; };
+TileCache tileCache[6];
+struct HeaderCache { bool app; bool elm; uint8_t screen; bool valid; };
+HeaderCache headerCache = {false, false, 0, false};
+
+bool tileDirty(uint8_t i) {
+  const Gauge& g = gauges[i];
+  const TileCache& c = tileCache[i];
+  if (g.hasValue != c.hasValue) return true;
+  if (g.hasValue && fabsf(g.value - c.value) >= 0.05f) return true;
+  if (g.trackMax && fabsf(g.maxValue - c.maxValue) >= 0.05f) return true;
+  return false;
 }
 
 void drawTile(uint8_t i) {
+  tileCache[i] = {gauges[i].value, gauges[i].maxValue, gauges[i].hasValue};
   const Gauge& g = gauges[i];
   int16_t tx = (i % COLS) * TILE_W;
   int16_t ty = HEADER_H + (i / COLS) * TILE_H;
@@ -349,7 +505,13 @@ void drawTile(uint8_t i) {
   tileSpr.pushSprite(tx, ty);
 }
 
+bool headerChanged(uint8_t screen) {
+  return !headerCache.valid || headerCache.app != bleClientConnected ||
+         headerCache.elm != elmReady || headerCache.screen != screen;
+}
+
 void drawHeader(uint8_t screen) {
+  headerCache = {bleClientConnected, elmReady, screen, true};
   tft.fillRect(0, 0, SCREEN_W, HEADER_H, TFT_BLACK);
   tft.setTextSize(1); 
   tft.setTextColor(TFT_WHITE);
@@ -409,13 +571,16 @@ void drawHalfCircleKpi(uint16_t centerX, const Gauge& gauge, const char* title) 
   tft.drawString(gauge.unit, centerX, centerY + 23);
 }
 
-void drawKpiScreen(bool clearScreen) {
+// Liefert true, wenn der komplette Screen (inkl. Header-Bereich) neu gezeichnet wurde.
+bool drawKpiScreen(bool clearScreen) {
   const bool screenChanged = clearScreen || (lastKpiScreen != currentScreen);
-  const bool oilChanged = fabsf(gauges[6].value - lastKpiOilTemp) > 0.5f;
-  const bool gearChanged = fabsf(gauges[2].value - lastKpiGearTemp) > 0.5f;
+  const bool oilChanged = (gauges[6].hasValue != lastKpiOilValid) ||
+                          (gauges[6].hasValue && fabsf(gauges[6].value - lastKpiOilTemp) > 0.5f);
+  const bool gearChanged = (gauges[2].hasValue != lastKpiGearValid) ||
+                           (gauges[2].hasValue && fabsf(gauges[2].value - lastKpiGearTemp) > 0.5f);
 
   if (!screenChanged && !oilChanged && !gearChanged) {
-    return;
+    return false;
   }
 
   tft.fillScreen(TFT_BLACK);
@@ -427,7 +592,10 @@ void drawKpiScreen(bool clearScreen) {
 
   lastKpiOilTemp = gauges[6].value;
   lastKpiGearTemp = gauges[2].value;
+  lastKpiOilValid = gauges[6].hasValue;
+  lastKpiGearValid = gauges[2].hasValue;
   lastKpiScreen = currentScreen;
+  return true;
 }
 
 void drawFutureScreen(bool clearScreen) {
@@ -444,16 +612,18 @@ void drawFutureScreen(bool clearScreen) {
 
 void drawDashboard(bool full) {
   uint8_t screen = currentScreen;
-  if (full) tft.fillScreen(TFT_BLACK);
+  bool headerWiped = full;
+  if (full && screen != 1) tft.fillScreen(TFT_BLACK);   // KPI-Screen loescht selbst
   if (screen == 0) {
-    if (full) drawHeader(screen);
-    for (uint8_t i = 0; i < 6; i++) drawTile(i);
+    for (uint8_t i = 0; i < 6; i++) {
+      if (full || tileDirty(i)) drawTile(i);        // nur geaenderte Kacheln neu zeichnen
+    }
   } else if (screen == 1) {
-    drawKpiScreen(full);
+    if (drawKpiScreen(full)) headerWiped = true;     // fillScreen hat den Header geloescht
   } else {
     drawFutureScreen(full);
   }
-  drawHeader(screen);
+  if (headerWiped || headerChanged(screen)) drawHeader(screen);
 }
 
 void redrawFromTouch() {
@@ -561,6 +731,7 @@ void setupTouch() {
 
 void setupBLE() {
   BLEDevice::init("RS3-Dashboard-BLE");
+  BLEDevice::setMTU(247);   // grosse MTU erlauben; Pakete sind aber nur 18 Byte und passen auch in die Default-MTU
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
@@ -568,8 +739,7 @@ void setupBLE() {
   pCharacteristic = pService->createCharacteristic(
                       CHARACTERISTIC_UUID,
                       BLECharacteristic::PROPERTY_READ   |
-                      BLECharacteristic::PROPERTY_NOTIFY |
-                      BLECharacteristic::PROPERTY_INDICATE
+                      BLECharacteristic::PROPERTY_NOTIFY
                     );
 
   pCharacteristic->addDescriptor(new BLE2902());
@@ -593,7 +763,7 @@ void setupBLE() {
 
 void setup() {
   Serial.begin(115200); 
-  delay(1000);
+  delay(300);
   tft.init(); 
   tft.setRotation(3); 
   tft.invertDisplay(true);
@@ -606,59 +776,32 @@ void setup() {
 
   setupBLE();
   drawDashboard(true);
+
+  // OBD-Abfrage in eigenem Task auf Core 0 (BT-Stack), Display + BLE bleiben in loop() auf Core 1.
+  xTaskCreatePinnedToCore(obdTask, "obd", 6144, NULL, 1, &obdTaskHandle, 0);
 }
 
 void loop() {
   uint32_t now = millis();
+  static uint32_t lastBleNotify = 0;
 
-  // 1. OBD Bluetooth Verbindung
-  if (!SerialBT.connected()) {
-    if (now - lastReconnect > 5000) {
-      lastReconnect = now; 
-      btConnected = false; 
-      elmReady = false;
-      Serial.println("Verbinde mit ELM327 BT...");
-      SerialBT.connect(BT_MAC); 
-      btConnectTime = millis();
-    }
-  } else {
-    if (!btConnected) {
-      btConnected = true;
-      btConnectTime = millis();
-    }
-    if (!elmReady && (now - btConnectTime > 2000)) { 
-      elmReady = initELM(); 
-    }
-  }
+  // 1. Veraltete Messwerte ausblenden
+  expireStaleGauges(now);
 
-  // 2. BLE Reconnect Handling
-  if (!bleClientConnected && oldBleClientConnected) {
-    delay(300);
-    pServer->startAdvertising(); 
+  // 2. BLE: nach Verbindungsabbruch Advertising nicht-blockierend neu starten
+  if (bleDisconnectedAt != 0 && !bleClientConnected && (now - bleDisconnectedAt) > 300) {
+    bleDisconnectedAt = 0;
+    pServer->startAdvertising();
     Serial.println("[BLE] Client getrennt -> Advertising neu gestartet!");
-    oldBleClientConnected = bleClientConnected;
   }
 
-  if (bleClientConnected && !oldBleClientConnected) {
-    oldBleClientConnected = bleClientConnected;
-  }
-
-  // 3. Dynamische OBD Abfrage
-  if (elmReady) { 
-    uint32_t obdInterval = bleClientConnected ? 10 : 1500;
-    static uint32_t lastObdPoll = 0;
-
-    if (now - lastObdPoll >= obdInterval) {
-      lastObdPoll = now;
-      if (currentScreen == 1 && currentGauge != 2 && currentGauge != 6) {
-        currentGauge = (currentGauge == 0) ? 2 : 6;
-      }
-      queryGauge(currentGauge); 
-      currentGauge = (currentGauge + 1) % 7; 
-      
-      if (!bleClientConnected) {
-        delay(60); 
-      }
+  // 3. BLE-Daten: bei neuen Werten (max. 10/s), sonst als Heartbeat jede Sekunde
+  if (bleClientConnected) {
+    uint32_t sinceLast = now - lastBleNotify;
+    if ((dataDirty && sinceLast >= BLE_NOTIFY_MIN_MS) || sinceLast >= BLE_HEARTBEAT_MS) {
+      dataDirty = false;
+      lastBleNotify = now;
+      sendBleData();
     }
   }
 
@@ -674,21 +817,5 @@ void loop() {
     }
   }
 
-  // 5. BLE Daten senden
-  if (bleClientConnected && (now - lastBleNotify > 200)) {
-    lastBleNotify = now;
-    sendBleJsonData();
-  }
-
-  // 6. Diagnostischer Status
-  if (now - lastBleStatusCheck > 5000) {
-    lastBleStatusCheck = now;
-    if (bleClientConnected) {
-      Serial.println("[BLE DEBUG] Zustand: VERBUNDEN mit App");
-    } else {
-      Serial.println("[BLE DEBUG] Zustand: BEREIT / Advertising aktiv");
-    }
-  }
-
-  yield();
+  vTaskDelay(pdMS_TO_TICKS(10));   // Core entlasten; BLE-Takt (>=100 ms) und Display (300 ms) brauchen nicht mehr
 }
