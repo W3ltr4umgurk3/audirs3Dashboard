@@ -1,6 +1,5 @@
 #include <Arduino.h>
-#include <Wire.h>
-#include <TFT_eSPI.h>
+#include "dashboard.h"
 #include "BluetoothSerial.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -15,8 +14,6 @@
 uint8_t   BT_MAC[6] = {0x13, 0xE0, 0x2F, 0x8D, 0x64, 0x43};
 const char* BT_PIN    = "1234";
 
-TFT_eSPI    tft = TFT_eSPI();
-TFT_eSprite tileSpr = TFT_eSprite(&tft);
 BluetoothSerial SerialBT;
 
 BLEServer* pServer = NULL;
@@ -24,32 +21,10 @@ BLECharacteristic* pCharacteristic = NULL;
 volatile bool bleClientConnected = false;
 uint32_t lastBleNotify = 0;
 
-#define SCREEN_W  320
-#define SCREEN_H  240
-#define HEADER_H   20
-#define COLS        3
-#define ROWS        2
-#define TILE_W    (SCREEN_W / COLS)
-#define TILE_H    ((SCREEN_H - HEADER_H) / ROWS)
-#define SCREEN_COUNT 3
-#define CTP_I2C_ADDRESS 0x38
 
-struct Gauge {
-  const char* label;
-  const char* unit;
-  float  value;
-  float  maxValue; 
-  float  warnLow;
-  float  warnHigh;
-  float  minVal;
-  float  maxVal;
-  bool   hasValue;
-  bool   trackMax;
-  uint32_t lastUpdate;      // (wird mit 0 initialisiert) millis() der letzten gueltigen Messung
-};
 
 // 7 Gauges: Indices 0..5 TFT, Index 6 BLE (Hintergrund)
-Gauge gauges[7] = {
+Gauge gauges[GAUGE_COUNT] = {
   {"Oeldruck",    "bar",  0.f, -100.f, 0.0f,     8.0f, 0.0f,  10.0f, false, true},  // 0 (TFT 1)
   {"Ladedruck",   "bar",  0.f, -100.f, -0.9f,    1.5f, -1.0f,   2.0f, false, true},  // 1 (TFT 2)
   {"Getriebe",    "C",    0.f, -100.f, 60.0f,  110.0f, 0.f,   130.0f, false, true},  // 2 (TFT 3)
@@ -84,7 +59,6 @@ const PIDDef pidDefs[7] = {
 #define BLE_NOTIFY_MIN_MS 100   // max. 10 Pakete/s bei neuen Daten
 #define BLE_HEARTBEAT_MS  1000   // Lebenszeichen auch ohne neue Daten
 #define PACKET_VERSION    0x01
-#define GAUGE_COUNT       7
 
 // Binaeres BLE-Paket (little endian, 18 Byte -> passt auch in die Default-MTU von 23).
 // v[i] = Wert von Gauge i * 100 (int16), Reihenfolge wie in gauges[].
@@ -107,37 +81,14 @@ const bool    pollSlow[GAUGE_COUNT]  = {false, false, false, true, true, true, f
 
 volatile bool btConnected = false, elmReady = false;
 volatile bool dataDirty = false;
-volatile bool needFullRedraw = true;
 bool useRespCount = true;     // ELM-Antwortanzahl anhaengen ("010B1"); wird bei "?" automatisch abgeschaltet
 uint8_t blePacketSeq = 0;
-uint32_t lastRedraw = 0, lastSessionKeepAlive = 0, btConnectTime = 0;
+uint32_t lastSessionKeepAlive = 0, btConnectTime = 0;
 volatile uint32_t bleDisconnectedAt = 0;
 uint32_t activeHeader = 0x000;
-volatile uint8_t currentScreen = 0;
 TaskHandle_t obdTaskHandle = NULL;
-bool touchWasPressed = false;
-bool touchGestureHandled = false;
-uint8_t touchStableSamples = 0;
-uint8_t touchReleaseSamples = 0;
-uint16_t touchStartX = 0;
-uint16_t touchStartY = 0;
-uint16_t touchLastX = 0;
-uint16_t touchLastY = 0;
-uint32_t lastTouchScan = 0;
-bool ctpReady = false;
-TaskHandle_t touchTaskHandle = NULL;
-SemaphoreHandle_t displayMutex = NULL;
 char rawBuf[128];
 float smoothedVolt = 0.0f;
-float lastKpiOilTemp = -999.0f;
-float lastKpiGearTemp = -999.0f;
-bool lastKpiOilValid = false;
-bool lastKpiGearValid = false;
-uint8_t lastKpiScreen = 255;
-
-void updateTouch();
-void touchTask(void* parameter);
-void redrawFromTouch();
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
@@ -391,11 +342,14 @@ void obdTask(void* parameter) {
     }
 
     bool includeSlow = (cycle % SLOW_EVERY) == 0;
-    bool screenKpiOnly = (currentScreen == 1) && !bleClientConnected;   // nur Oeltemp + Getriebe noetig
+    // Ohne App nur die Werte der sichtbaren Seite jeden Zyklus abfragen (schnellere Updates),
+    // alle anderen nur jeden 4. Zyklus -> Warnungen bleiben global aktiv, Werte werden nicht "stale".
+    const bool bgCycle = (cycle % 4) == 0;
+    const uint8_t visible = ui_visibleMask();
     for (uint8_t n = 0; n < GAUGE_COUNT && elmReady; n++) {
       uint8_t idx = pollOrder[n];
       if (pollSlow[idx] && !includeSlow) continue;
-      if (screenKpiOnly && idx != 2 && idx != 6) continue;
+      if (!bleClientConnected && !(visible & (1u << idx)) && !bgCycle) continue;
 
       if (queryGauge(idx)) {
         failStreak = 0;
@@ -439,300 +393,6 @@ void sendBleData() {
   DBG("[BLE TX] seq=%u mask=%02X\n", pkt.seq, pkt.validMask);
 }
 
-// Zuletzt gezeichneter Zustand pro Kachel / Header: gezeichnet wird nur, was sich geaendert hat.
-struct TileCache { float value; float maxValue; bool hasValue; };
-TileCache tileCache[6];
-struct HeaderCache { bool app; bool elm; uint8_t screen; bool valid; };
-HeaderCache headerCache = {false, false, 0, false};
-
-bool tileDirty(uint8_t i) {
-  const Gauge& g = gauges[i];
-  const TileCache& c = tileCache[i];
-  if (g.hasValue != c.hasValue) return true;
-  if (g.hasValue && fabsf(g.value - c.value) >= 0.05f) return true;
-  if (g.trackMax && fabsf(g.maxValue - c.maxValue) >= 0.05f) return true;
-  return false;
-}
-
-void drawTile(uint8_t i) {
-  tileCache[i] = {gauges[i].value, gauges[i].maxValue, gauges[i].hasValue};
-  const Gauge& g = gauges[i];
-  int16_t tx = (i % COLS) * TILE_W;
-  int16_t ty = HEADER_H + (i / COLS) * TILE_H;
-  int16_t cx = TILE_W / 2;
-  int16_t cy = TILE_H / 2;
-  
-  tileSpr.fillSprite(TFT_BLACK);
-  tileSpr.drawRect(0, 0, TILE_W, TILE_H, TFT_RED);
-
-  tileSpr.setTextColor(TFT_YELLOW); 
-  tileSpr.setCursor(5, 7); 
-  tileSpr.print(g.label);
-
-  if (g.trackMax && (g.maxValue > -99.f)) {
-    tileSpr.setTextDatum(TR_DATUM); 
-    tileSpr.setTextColor(TFT_CYAN);
-    char mBuf[10];
-    if (i == 5 || i == 4 || i == 1 || i == 0) dtostrf(g.maxValue, 2, 1, mBuf); 
-    else snprintf(mBuf, sizeof(mBuf), "M:%d", (int)roundf(g.maxValue));
-    tileSpr.drawString(mBuf, TILE_W - 5, 7);
-  }
-
-  tileSpr.setTextDatum(MC_DATUM);
-  uint16_t vCol = TFT_WHITE;
-  if (g.hasValue) {
-    char buf[12];
-    if (i == 5 || i == 4 || i == 1 || i == 0) dtostrf(g.value, 2, 1, buf); 
-    else snprintf(buf, sizeof(buf), "%d", (int)roundf(g.value));
-    
-    if (g.value < g.warnLow || g.value > g.warnHigh) vCol = TFT_RED;
-    tileSpr.setTextColor(vCol); 
-    tileSpr.setTextSize(3);
-    tileSpr.drawString(buf, cx, cy - 5);
-  } else {
-    tileSpr.setTextColor(TFT_DARKGREY); 
-    tileSpr.setTextSize(3); 
-    tileSpr.drawString("---", cx, cy - 5);
-  }
-
-  tileSpr.setTextSize(1); 
-  tileSpr.setTextColor(TFT_CYAN);
-  tileSpr.drawString(g.unit, cx, cy + 18);
-
-  int16_t bX = 8, bY = TILE_H - 12, bW = TILE_W - 16, bH = 5;
-  tileSpr.drawRect(bX, bY, bW, bH, TFT_DARKGREY);
-  if (g.hasValue) {
-    float pct = constrain((g.value - g.minVal) / (g.maxVal - g.minVal), 0.0f, 1.0f);
-    tileSpr.fillRect(bX + 1, bY + 1, pct * (bW - 2), bH - 2, (vCol == TFT_RED) ? TFT_RED : TFT_GREEN);
-  }
-
-  tileSpr.pushSprite(tx, ty);
-}
-
-bool headerChanged(uint8_t screen) {
-  return !headerCache.valid || headerCache.app != bleClientConnected ||
-         headerCache.elm != elmReady || headerCache.screen != screen;
-}
-
-void drawHeader(uint8_t screen) {
-  headerCache = {bleClientConnected, elmReady, screen, true};
-  tft.fillRect(0, 0, SCREEN_W, HEADER_H, TFT_BLACK);
-  tft.setTextSize(1); 
-  tft.setTextColor(TFT_WHITE);
-  tft.setCursor(5, 5); 
-  tft.print("RS3 8V DAZA");
-
-  tft.setTextDatum(TR_DATUM);
-  int rightX = SCREEN_W - 5;
-
-  tft.setTextColor(bleClientConnected ? TFT_CYAN : TFT_DARKGREY);
-  tft.drawString(bleClientConnected ? "APP:ON" : "APP:OFF", rightX, 5);
-  rightX -= 55;
-
-  tft.setTextColor(elmReady ? TFT_GREEN : TFT_RED);
-  tft.drawString(elmReady ? "ELM:ON" : "ELM:OFF", rightX, 5);
-
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_WHITE);
-  char pageBuf[8];
-  snprintf(pageBuf, sizeof(pageBuf), "%d/3", screen + 1);
-  tft.drawString(pageBuf, SCREEN_W / 2, 5);
-}
-
-void drawHalfCircleKpi(uint16_t centerX, const Gauge& gauge, const char* title) {
-  const int16_t centerY = 155;
-  const int16_t radius = 65;
-  const float range = gauge.maxVal - gauge.minVal;
-  float percent = gauge.hasValue && range > 0.0f
-                    ? constrain((gauge.value - gauge.minVal) / range, 0.0f, 1.0f)
-                    : 0.0f;
-  uint16_t valueColor = (gauge.hasValue &&
-                         (gauge.value < gauge.warnLow || gauge.value > gauge.warnHigh))
-                          ? TFT_RED : TFT_GREEN;
-
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_YELLOW);
-  tft.drawString(title, centerX, 35);
-  tft.drawArc(centerX, centerY, radius, radius - 10, 90, 270, TFT_DARKGREY, TFT_BLACK);
-  if (percent > 0.0f) {
-    tft.drawArc(centerX, centerY, radius, radius - 10,
-                90, 90 + (uint16_t)(percent * 180.0f), valueColor, TFT_BLACK);
-  }
-
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(gauge.hasValue ? valueColor : TFT_DARKGREY);
-  tft.setTextSize(3);
-  if (gauge.hasValue) {
-    char valueBuf[12];
-    if (gauge.unit[0] == 'C') snprintf(valueBuf, sizeof(valueBuf), "%d", (int)roundf(gauge.value));
-    else dtostrf(gauge.value, 2, 1, valueBuf);
-    tft.drawString(valueBuf, centerX, centerY - 5);
-  } else {
-    tft.drawString("---", centerX, centerY - 5);
-  }
-  tft.setTextSize(1);
-  tft.setTextColor(TFT_CYAN);
-  tft.drawString(gauge.unit, centerX, centerY + 23);
-}
-
-// Liefert true, wenn der komplette Screen (inkl. Header-Bereich) neu gezeichnet wurde.
-bool drawKpiScreen(bool clearScreen) {
-  const bool screenChanged = clearScreen || (lastKpiScreen != currentScreen);
-  const bool oilChanged = (gauges[6].hasValue != lastKpiOilValid) ||
-                          (gauges[6].hasValue && fabsf(gauges[6].value - lastKpiOilTemp) > 0.5f);
-  const bool gearChanged = (gauges[2].hasValue != lastKpiGearValid) ||
-                           (gauges[2].hasValue && fabsf(gauges[2].value - lastKpiGearTemp) > 0.5f);
-
-  if (!screenChanged && !oilChanged && !gearChanged) {
-    return false;
-  }
-
-  tft.fillScreen(TFT_BLACK);
-  drawHalfCircleKpi(82, gauges[6], "OELTEMP");
-  drawHalfCircleKpi(238, gauges[2], "GETRIEBE");
-  tft.setTextDatum(BC_DATUM);
-  tft.setTextColor(TFT_DARKGREY);
-  tft.drawString("Touch links/rechts zum Wechseln", SCREEN_W / 2, SCREEN_H - 3);
-
-  lastKpiOilTemp = gauges[6].value;
-  lastKpiGearTemp = gauges[2].value;
-  lastKpiOilValid = gauges[6].hasValue;
-  lastKpiGearValid = gauges[2].hasValue;
-  lastKpiScreen = currentScreen;
-  return true;
-}
-
-void drawFutureScreen(bool clearScreen) {
-  if (clearScreen) tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(TFT_CYAN);
-  tft.setTextSize(2);
-  tft.drawString("SCREEN 3", SCREEN_W / 2, 100);
-  tft.setTextSize(1);
-  tft.setTextColor(TFT_DARKGREY);
-  tft.drawString("Noch nicht festgelegt", SCREEN_W / 2, 130);
-  tft.drawString("Touch links/rechts zum Wechseln", SCREEN_W / 2, SCREEN_H - 8);
-}
-
-void drawDashboard(bool full) {
-  uint8_t screen = currentScreen;
-  bool headerWiped = full;
-  if (full && screen != 1) tft.fillScreen(TFT_BLACK);   // KPI-Screen loescht selbst
-  if (screen == 0) {
-    for (uint8_t i = 0; i < 6; i++) {
-      if (full || tileDirty(i)) drawTile(i);        // nur geaenderte Kacheln neu zeichnen
-    }
-  } else if (screen == 1) {
-    if (drawKpiScreen(full)) headerWiped = true;     // fillScreen hat den Header geloescht
-  } else {
-    drawFutureScreen(full);
-  }
-  if (headerWiped || headerChanged(screen)) drawHeader(screen);
-}
-
-void redrawFromTouch() {
-  if (displayMutex != NULL && xSemaphoreTake(displayMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    drawDashboard(true);
-    needFullRedraw = false;
-    lastRedraw = millis();
-    xSemaphoreGive(displayMutex);
-  }
-}
-
-void updateTouch() {
-  if (!ctpReady) return;
-  if (millis() - lastTouchScan < 15) return;
-  lastTouchScan = millis();
-
-  Wire.beginTransmission(CTP_I2C_ADDRESS);
-  Wire.write(0x02); // Number of touch points (FT6x06/FT6236)
-  if (Wire.endTransmission(false) != 0 || Wire.requestFrom(CTP_I2C_ADDRESS, 5u) != 5u) {
-    touchGestureHandled = false;
-    return;
-  }
-
-  uint8_t touches = Wire.read() & 0x0F;
-  uint8_t xHigh = Wire.read();
-  uint8_t xLow = Wire.read();
-  uint8_t yHigh = Wire.read();
-  uint8_t yLow = Wire.read();
-  bool pressed = touches > 0;
-  uint16_t rawX = ((xHigh & 0x0F) << 8) | xLow;
-  uint16_t rawY = ((yHigh & 0x0F) << 8) | yLow;
-
-  // The panel reports portrait coordinates; rotation 3 is landscape 320x240.
-  uint16_t x = constrain(rawY, 0, SCREEN_W - 1);
-  uint16_t y = constrain((SCREEN_H - 1) - rawX, 0, SCREEN_H - 1);
-  if (pressed) {
-    touchReleaseSamples = 0;
-    if (!touchWasPressed) {
-      touchStartX = x;
-      touchStartY = y;
-      touchGestureHandled = false;
-      touchStableSamples = 1;
-    } else if (abs((int)x - (int)touchLastX) < 35 && abs((int)y - (int)touchLastY) < 35) {
-      touchStableSamples = min((uint8_t)3, (uint8_t)(touchStableSamples + 1));
-    } else {
-      touchStableSamples = 0;
-    }
-    touchLastX = x;
-    touchLastY = y;
-
-    int16_t deltaX = (int16_t)x - (int16_t)touchStartX;
-    int16_t deltaY = (int16_t)y - (int16_t)touchStartY;
-    if (!touchGestureHandled && touchStableSamples >= 1 && abs(deltaX) >= 35 && abs(deltaY) < 120) {
-      if (deltaX < 0) {
-        currentScreen = (currentScreen + SCREEN_COUNT - 1) % SCREEN_COUNT;
-      } else {
-        currentScreen = (currentScreen + 1) % SCREEN_COUNT;
-      }
-      touchGestureHandled = true;
-      needFullRedraw = true;
-      lastRedraw = 0;
-      Serial.printf("[TOUCH] Swipe erkannt, Screen %u\n", currentScreen + 1);
-      redrawFromTouch();
-    }
-  } else if (touchWasPressed) {
-    touchReleaseSamples = min((uint8_t)3, (uint8_t)(touchReleaseSamples + 1));
-    if (touchReleaseSamples < 2) return;
-  }
-
-  if (!pressed) {
-    touchGestureHandled = false;
-  }
-  touchWasPressed = pressed;
-}
-
-void touchTask(void* parameter) {
-  (void)parameter;
-  for (;;) {
-    updateTouch();
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-}
-
-void setupTouch() {
-  pinMode(CTP_RST, OUTPUT);
-  digitalWrite(CTP_RST, LOW);
-  delay(10);
-  digitalWrite(CTP_RST, HIGH);
-  pinMode(CTP_INT, INPUT_PULLUP);
-  Wire.begin(CTP_SDA, CTP_SCL);
-  Wire.setClock(400000);
-
-  Wire.beginTransmission(CTP_I2C_ADDRESS);
-  if (Wire.endTransmission() == 0) {
-    ctpReady = true;
-    Serial.printf("Capacitive Touch bereit, I2C-Adresse 0x%02X.\n", CTP_I2C_ADDRESS);
-  } else {
-    Serial.println("Kein capacitive Touch-Controller auf I2C 0x38 gefunden.");
-    Serial.println("Pruefe CTP_SDA, CTP_SCL, CTP_RST, 3V3 und GND.");
-  }
-
-  xTaskCreatePinnedToCore(touchTask, "touch", 4096, NULL, 2, &touchTaskHandle, 0);
-  Serial.println("Touch-Abfrage laeuft unabhaengig von Bluetooth.");
-}
-
 void setupBLE() {
   BLEDevice::init("RS3-Dashboard-BLE");
   BLEDevice::setMTU(247);   // grosse MTU erlauben; Pakete sind aber nur 18 Byte und passen auch in die Default-MTU
@@ -766,23 +426,19 @@ void setupBLE() {
 }
 
 void setup() {
-  Serial.begin(115200); 
+  Serial.begin(115200);
   delay(300);
-  tft.init(); 
-  tft.setRotation(3); 
-  tft.invertDisplay(true);
-  tileSpr.createSprite(TILE_W, TILE_H);
-  displayMutex = xSemaphoreCreateMutex();
-  setupTouch();
-  
-  SerialBT.begin("RS3-Dashboard", true); 
+  ui_begin();   // vor Bluetooth, solange noch genug zusammenhaengender RAM fuer den Framebuffer-Streifen frei ist
+
+  SerialBT.begin("RS3-Dashboard", true);
   SerialBT.setPin(BT_PIN);
 
   setupBLE();
-  drawDashboard(true);
 
   // OBD-Abfrage in eigenem Task auf Core 0 (BT-Stack), Display + BLE bleiben in loop() auf Core 1.
   xTaskCreatePinnedToCore(obdTask, "obd", 6144, NULL, 1, &obdTaskHandle, 0);
+
+  ui_splash();   // Startanimation, waehrend im Hintergrund schon BT/BLE hochlaufen
 }
 
 void loop() {
@@ -809,17 +465,8 @@ void loop() {
     }
   }
 
-  // 4. TFT Update
-  uint32_t redrawDelay = (currentScreen == 1) ? 1000u : 300u;
-  if (needFullRedraw || now - lastRedraw > redrawDelay) {
-    bool fullRedraw = needFullRedraw;
-    needFullRedraw = false;
-    lastRedraw = now;
-    if (displayMutex != NULL && xSemaphoreTake(displayMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      drawDashboard(fullRedraw);
-      xSemaphoreGive(displayMutex);
-    }
-  }
+  // 4. Display: Touch, Animationen, Rendern (zeichnet nur, wenn sich etwas geaendert hat)
+  ui_tick();
 
-  vTaskDelay(pdMS_TO_TICKS(10));   // Core entlasten; BLE-Takt (>=100 ms) und Display (300 ms) brauchen nicht mehr
+  vTaskDelay(pdMS_TO_TICKS(5));
 }
