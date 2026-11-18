@@ -31,18 +31,23 @@ Gauge gauges[GAUGE_COUNT] = {
   {"Ansaugtemp",  "C",    0.f, -100.f, -20.f,   60.0f, -20.f,  80.0f, false, true},  // 3 (TFT 4)
   {"Tankinhalt",  "L",    0.f, -100.f, 10.0f,   60.0f,  0.f,   60.0f, false, false}, // 4 (TFT 5)
   {"Batterie",    "V",    0.f, -100.f, 11.7f,   15.3f, 10.f,   16.0f, false, true},  // 5 (TFT 6)
-  {"Oeltemp",     "C",    0.f, -100.f, 80.0f,  110.0f, 0.0f, 130.0f, false, true}   // 6 (BLE / Datenpool)
+  {"Oeltemp",     "C",    0.f, -100.f, 80.0f,  110.0f, 0.0f, 130.0f, false, true},  // 6 (BLE / Datenpool)
+  {"Haldex",      "C",    0.f, -100.f, 0.0f,   115.0f, 0.0f, 130.0f, false, true},  // 7 (nur Display)
+  {"Kat",         "C",    0.f, -100.f, 0.0f,   950.0f, 0.0f, 1000.0f, false, true}  // 8 (nur Display)
 };
 
 struct PIDDef { uint8_t mode; uint16_t pid; uint32_t header; bool isExtended; };
-const PIDDef pidDefs[7] = {
-  {22, 0x13F4, 0x7E0, false}, // 0: Oeldruck (UDS DAZA, candidate DID)
+// mode 0 = noch nicht abfragbar (DID unbekannt) -> wird uebersprungen, Anzeige bleibt "---"
+const PIDDef pidDefs[GAUGE_COUNT] = {
+  {22, 0x10EB, 0x7E0, false}, // 0: Oeldruck (UDS DAZA, DID 10EB, 1/1000 bar)
   { 1, 0x0B,   0x7DF, false}, // 1: Ladedruck
   {22, 0x2104, 0x7E1, false}, // 2: Getriebe (UDS DSG)
   { 1, 0x0F,   0x7DF, false}, // 3: Ansaugtemp
   { 1, 0x2F,   0x7DF, false}, // 4: Tankinhalt
   { 1, 0x42,   0x7DF, false}, // 5: Batterie
-  {22, 0x115C, 0x7E0, false}  // 6: Öltemperatur (UDS DAZA PID 115C)
+  {22, 0x1065, 0x7E0, false}, // 6: Öltemperatur (UDS DAZA DID 1065, 1/10 K)
+  { 0, 0x0000, 0x70F, false}, // 7: Haldex-Temperatur (Steuergeraet 70F/779 gefunden, DID noch offen)
+  { 1, 0x3C,   0x7DF, false}  // 8: Katalysatortemperatur B1S1 (Standard-PID 013C, (A*256+B)/10-40)
 };
 
 // Debug-Ausgaben der OBD-/BLE-Daten (Serial.printf blockiert ~10 ms pro Zeile).
@@ -69,15 +74,15 @@ struct __attribute__((packed)) BlePacket {
   uint8_t seq;
   uint8_t validMask;
   uint8_t status;
-  int16_t v[GAUGE_COUNT];
+  int16_t v[BLE_GAUGE_COUNT];
 };
 static_assert(sizeof(BlePacket) == 18, "BlePacket muss 18 Byte gross sein");
 
 // Abfrage-Reihenfolge nach Header gruppiert (7DF -> 7E0 -> 7E1), damit weniger ATSH noetig sind.
 // "schnell" = jeder Zyklus, "langsam" = nur jeder SLOW_EVERY-te Zyklus (aendert sich kaum).
 #define SLOW_EVERY 5
-const uint8_t pollOrder[GAUGE_COUNT] = {1, 3, 4, 5, 0, 6, 2};
-const bool    pollSlow[GAUGE_COUNT]  = {false, false, false, true, true, true, false};
+const uint8_t pollOrder[GAUGE_COUNT] = {1, 3, 4, 5, 8, 0, 6, 2, 7};
+const bool    pollSlow[GAUGE_COUNT]  = {false, false, false, true, true, true, false, true, false};
 
 volatile bool btConnected = false, elmReady = false;
 volatile bool dataDirty = false;
@@ -172,24 +177,15 @@ bool initELM() {
   return true;
 }
 
+// Oeldruck: DID 10EB (Motor-ECU 7E0), Rohwert in 1/1000 bar. Aus Scan + Car-Scanner-Screenshot
+// abgeleitet (Motor aus: 0x03D9 = 985 -> 0,98 bar). Noch nicht bei laufendem Motor verifiziert.
 float decodeOilPressureBar(uint16_t raw16) {
-  // Many DAZA ECUs expose oil pressure as a normalized 15-bit fixed-point value
-  // around 0x8000 for ~1.0 bar. Example: 0x80F4 => 33044 / 32768 ~= 1.008 bar.
-  // A direct raw/100 conversion yields ~330 bar and is clearly wrong.
-  float normalized = (float)raw16 / 32768.0f;
-  if (normalized >= 0.05f && normalized <= 10.0f) {
-    return normalized;
-  }
-  return (float)raw16 / 100.0f;
+  return (float)raw16 / 1000.0f;
 }
 
+// Oeltemperatur: DID 1065 (Motor-ECU 7E0), Rohwert in 1/10 Kelvin (0x0B1A = 2842 -> 11,05 C).
 float decodeOilTempC(uint16_t raw16) {
-  // This DAZA ECU reports 0x2710 for ~21 °C, which is consistent with a raw/100 value minus 79 °C.
-  // The previous offset of -85 °C produced the incorrect 15 °C reading.
-  float temp = (float)raw16 / 100.0f;
-  if (raw16 == 0x2710u) return 21.0f;
-  if (temp >= 70.0f && temp <= 130.0f) return temp - 79.0f;
-  return temp - 85.0f;
+  return (float)raw16 / 10.0f - 273.15f;
 }
 
 // Liefert true, wenn eine auswertbare Antwort kam (Timeout/Parsefehler = false).
@@ -246,11 +242,10 @@ bool queryGauge(uint8_t idx) {
     if (strstr(p, search)) p += strlen(search); else p += 2;
     if (strlen(p) < 2) return false;
 
-    if (idx == 0 && def.pid == 0x13F4) { // Oeldruck: real ECU payloads are not a direct 0.01 bar integer.
+    if (idx == 0 && def.pid == 0x10EB) { // Oeldruck
       uint16_t raw16 = ((uint16_t)hexByte(p) << 8) | hexByte(p + 2);
       gauges[idx].value = decodeOilPressureBar(raw16);
-      DBG("[OIL PRESSURE RAW] DID 13F4: %04X -> %.2f bar (normalized 32768-based decode)\n",
-          raw16, gauges[idx].value);
+      DBG("[OIL PRESSURE RAW] DID 10EB: %04X -> %.3f bar\n", raw16, gauges[idx].value);
     }
     else if (idx == 1) { // Ladedruck
       float absBar = (float)hexByte(p) / 100.0f;
@@ -262,13 +257,17 @@ bool queryGauge(uint8_t idx) {
       gauges[idx].value = smoothedVolt;
     }
     else if (def.mode == 1) {
-      if (def.pid == 0x2F) gauges[idx].value = ((float)hexByte(p) * 100.0f / 255.0f) * 0.55f; // Tank
+      if (def.pid == 0x3C) {   // Katalysator B1S1: (A*256+B)/10 - 40
+        uint16_t r = ((uint16_t)hexByte(p) << 8) | hexByte(p + 2);
+        gauges[idx].value = (float)r / 10.0f - 40.0f;
+      }
+      else if (def.pid == 0x2F) gauges[idx].value = ((float)hexByte(p) * 100.0f / 255.0f) * 0.55f; // Tank
       else                 gauges[idx].value = (float)hexByte(p) - 40.0f; // Ansaugtemp
     }
     else if (def.pid == 0x2104) { // Getriebe (DSG 7E1)
       gauges[idx].value = (float)hexByte(p); 
     }
-    else if (def.pid == 0x115C) { // Öltemperatur Motor ECU (UDS PID 115C)
+    else if (def.pid == 0x1065) { // Öltemperatur Motor ECU (UDS DID 1065)
       uint16_t raw16 = ((uint16_t)hexByte(p) << 8) | hexByte(p + 2);
       gauges[idx].value = decodeOilTempC(raw16);
     }
@@ -296,6 +295,73 @@ void expireStaleGauges(uint32_t now) {
     if (gauges[i].hasValue && (now - gauges[i].lastUpdate) > STALE_MS) {
       gauges[i].hasValue = false;
       dataDirty = true;
+    }
+  }
+}
+
+// Diagnose-Konsole ueber den USB-Serial-Monitor (115200 Baud, Zeilenende "Newline"):
+//   <Befehl>                  wird 1:1 an den ELM327 geschickt, z.B. ATSH7E0, 015C, 2213F4
+//   SCAN <hdr> <von> <bis>    sucht UDS-DIDs (Service 22), z.B. SCAN 7E0 1100 13FF
+// Laeuft im OBD-Task, damit sich Konsole und normale Abfrage nie ins Gehege kommen.
+static uint32_t consoleHoldUntil = 0;
+
+static void consoleScan(const char* args) {
+  unsigned hdr = 0, from = 0, to = 0, resp = 0;
+  int n = sscanf(args, "%x %x %x %x", &hdr, &from, &to, &resp);
+  if (n < 3 || to < from || to > 0xFFFF) {
+    Serial.println("Syntax: SCAN <hdr> <von> <bis> [antwort-id]   z.B. SCAN 70F 1000 1FFF 779");
+    return;
+  }
+  char cmd[32];
+  snprintf(cmd, sizeof(cmd), "ATSH%03X", hdr);
+  elmRawCmd(cmd, 300);
+  if (n == 4) {                                   // Nicht-OBD-Steuergeraet: Antwort-ID fest vorgeben
+    snprintf(cmd, sizeof(cmd), "ATCRA%03X", resp);
+    elmRawCmd(cmd, 300);
+  }
+  elmRawCmd("1003", 300);
+  Serial.printf("[SCAN] Header %03X, DIDs %04X-%04X (beliebige Eingabe bricht ab)\n", hdr, from, to);
+  uint32_t found = 0;
+  for (unsigned did = from; did <= to; did++) {
+    if (Serial.available()) { while (Serial.available()) Serial.read(); Serial.println("[SCAN] abgebrochen"); break; }
+    if (!SerialBT.connected()) { Serial.println("[SCAN] BT-Verbindung weg"); break; }
+    snprintf(cmd, sizeof(cmd), "22%04X%s", did, useRespCount ? "1" : "");
+    if (!elmRawCmd(cmd, 400)) continue;
+    char expect[8];
+    snprintf(expect, sizeof(expect), "62%04X", did);
+    if (strstr(rawBuf, expect)) {
+      found++;
+      Serial.printf("[SCAN] %04X -> %s\n", did, rawBuf);
+    } else if (strstr(rawBuf, "7F22") && !strstr(rawBuf, "7F2231") && !strstr(rawBuf, "7F2278")) {
+      Serial.printf("[SCAN] %04X NRC: %s\n", did, rawBuf);   // z.B. 33 = Security Access noetig
+    }
+    if ((did & 0x3F) == 0x3F) Serial.printf("[SCAN] ... %04X\n", did);
+  }
+  Serial.printf("[SCAN] fertig, %u Treffer\n", (unsigned)found);
+  if (n == 4) elmRawCmd("ATAR", 300);             // Antwortfilter wieder automatisch
+  activeHeader = 0;
+}
+
+static void consoleTick() {
+  static char line[64];
+  static uint8_t len = 0;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r' || c == '\n') {
+      if (len == 0) continue;
+      line[len] = '\0';
+      len = 0;
+      for (char* q = line; *q; q++) *q = toupper((unsigned char)*q);
+      if (strncmp(line, "SCAN", 4) == 0) {
+        consoleScan(line + 4);
+      } else {
+        Serial.printf("> %s\n", line);
+        bool ok = elmRawCmd(line, 1500);
+        Serial.printf("< %s\n", ok ? rawBuf : "(keine Antwort)");
+        consoleHoldUntil = millis() + 30000;   // Abfrage pausiert, damit ATSH & Co. erhalten bleiben
+      }
+    } else if (len < sizeof(line) - 1) {
+      line[len++] = c;
     }
   }
 }
@@ -341,13 +407,21 @@ void obdTask(void* parameter) {
       continue;
     }
 
+    consoleTick();
+    if (consoleHoldUntil) {
+      if ((int32_t)(millis() - consoleHoldUntil) < 0) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+      consoleHoldUntil = 0;
+      activeHeader = 0;   // Konsole kann den Header geaendert haben -> Abfrage setzt ihn neu
+    }
+
     bool includeSlow = (cycle % SLOW_EVERY) == 0;
     // Ohne App nur die Werte der sichtbaren Seite jeden Zyklus abfragen (schnellere Updates),
     // alle anderen nur jeden 4. Zyklus -> Warnungen bleiben global aktiv, Werte werden nicht "stale".
     const bool bgCycle = (cycle % 4) == 0;
-    const uint8_t visible = ui_visibleMask();
+    const uint16_t visible = ui_visibleMask();
     for (uint8_t n = 0; n < GAUGE_COUNT && elmReady; n++) {
       uint8_t idx = pollOrder[n];
+      if (pidDefs[idx].mode == 0) continue;            // DID noch unbekannt (Haldex)
       if (pollSlow[idx] && !includeSlow) continue;
       if (!bleClientConnected && !(visible & (1u << idx)) && !bgCycle) continue;
 
@@ -381,7 +455,7 @@ void sendBleData() {
   pkt.seq = blePacketSeq++;
   pkt.validMask = 0;
   pkt.status = (elmReady ? 0x01 : 0) | (btConnected ? 0x02 : 0);
-  for (uint8_t i = 0; i < GAUGE_COUNT; i++) {
+  for (uint8_t i = 0; i < BLE_GAUGE_COUNT; i++) {
     bool ok = gauges[i].hasValue;
     if (ok) pkt.validMask |= (1 << i);
     pkt.v[i] = ok ? toFixed100(gauges[i].value) : 0;

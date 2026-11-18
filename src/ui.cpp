@@ -71,6 +71,10 @@ static const Stop stBatt[]   = {{10.f, C_BAD}, {11.7f, C_BAD}, {12.1f, C_OK}, {1
                                 {15.3f, C_BAD}, {16.f, C_BAD}};
 static const Stop stOilT[]   = {{0.f, C_COLD}, {60.f, C_COLD}, {80.f, C_OK}, {100.f, C_OK},
                                 {105.f, C_AMB}, {110.f, C_BAD}, {130.f, C_BAD}};
+static const Stop stHaldex[] = {{0.f, C_COLD}, {40.f, C_COLD}, {60.f, C_OK}, {100.f, C_OK},
+                                {110.f, C_AMB}, {115.f, C_BAD}, {130.f, C_BAD}};
+static const Stop stCat[]    = {{0.f, C_COLD}, {300.f, C_COLD}, {400.f, C_OK}, {850.f, C_OK},
+                                {900.f, C_AMB}, {950.f, C_BAD}, {1000.f, C_BAD}};
 static const Stop stAccent[] = {{0.f, rgb(110, 0, 0)}, {1.f, C_ACC}};
 
 #define NSTOPS(a) ((uint8_t)(sizeof(a) / sizeof((a)[0])))
@@ -91,13 +95,15 @@ static const GaugeUi gui[GAUGE_COUNT] = {
   {"TANK",       "TANK",      stTank,   NSTOPS(stTank),   1, true,  5.f},
   {"BATTERIE",   "BATTERIE",  stBatt,   NSTOPS(stBatt),   1, true,  1.f},
   {"OELTEMP",    "OEL T",     stOilT,   NSTOPS(stOilT),   0, false, 20.f},
+  {"HALDEX",     "HALDEX",    stHaldex, NSTOPS(stHaldex), 0, false, 20.f},
+  {"KAT",        "KAT",       stCat,    NSTOPS(stCat),    0, false, 100.f},
 };
 
 // Welche Gauges zeigt welche Seite? (Bitmaske, fuer OBD-Abfragepriorisierung)
 #define BIT(g) (1u << (g))
-static const uint8_t pageMask[PAGE_COUNT] = {
+static const uint16_t pageMask[PAGE_COUNT] = {
   BIT(G_BOOST) | BIT(G_OIL_P) | BIT(G_OIL_T) | BIT(G_GEAR) | BIT(G_INTAKE),   // DRIVE
-  BIT(G_OIL_P) | BIT(G_OIL_T),                                                 // MOTOR
+  BIT(G_OIL_T) | BIT(G_GEAR) | BIT(G_OIL_P) | BIT(G_HALDEX) | BIT(G_CAT) | BIT(G_INTAKE),  // NORDSCHLEIFE
   BIT(G_OIL_T) | BIT(G_GEAR) | BIT(G_INTAKE),                                  // TEMPERATUREN
   BIT(G_BATT)  | BIT(G_TANK),                                                  // FAHRZEUG
 };
@@ -149,7 +155,7 @@ static uint8_t     page = 0;                     // aktuell gefuehrte Seite
 static float       slide = 0.f;                  // horizontaler Versatz der Seite in px (<0: Finger links)
 static float       slideTarget = 0.f;
 static bool        settling = false;
-static volatile uint8_t visMask = 0;
+static volatile uint16_t visMask = 0;
 
 static uint32_t    toastUntil = 0;
 static bool        gBlink = false;               // Blinkphase fuer Warnungen (pro Frame konstant)
@@ -392,20 +398,32 @@ static void pageDrive() {
   card(254, 128, 62, 94, G_INTAKE);
 }
 
-static void pageEngine() {
-  dTitle("MOTOR");
-  ringBlock(82, 122, 56, 70, 40, G_OIL_P, -37, -4, 31, 80);
-  ringBlock(238, 122, 56, 70, 40, G_OIL_T, -37, -4, 31, 80);
-  // Skalenenden
-  for (int k = 0; k < 2; k++) {
-    uint8_t g = (k == 0) ? G_OIL_P : G_OIL_T;
-    int cx = (k == 0) ? 82 : 238;
-    char lo[8], hi[8];
-    snprintf(lo, sizeof(lo), "%g", gauges[g].minVal);
-    snprintf(hi, sizeof(hi), "%g", gauges[g].maxVal);
-    dText(lo, cx - 52, 182, 1, MC_DATUM, C_DIM, 5);
-    dText(hi, cx + 52, 182, 1, MC_DATUM, C_DIM, 5);
+// Grosse Kachel: Name oben links, Einheit oben rechts, Wert gross rechtsbuendig (NORDSCHLEIFE-Seite)
+static void nordCard(int x, int y, int w, uint8_t g) {
+  const Gauge& G = gauges[g];
+  const int h = 64;
+  dRRect(x, y, w, h, 8, C_CARD);
+  dRRectO(x, y, w, h, 8, C_TRACK);
+  if (gBlink && inAlarm(g)) dRRectO(x, y, w, h, 8, C_BAD);
+  dText(gui[g].name, x + 9, y + 10, 2, ML_DATUM, C_DIM, 9);
+  dUnit(G.unit, x + w - 16, y + 10, 2, C_ACC);
+  char b[12];
+  if (G.hasValue) {
+    fmtValue(b, sizeof(b), g, G.value);
+    dText(b, x + w - 10, y + 40, 7, MR_DATUM, valColor(g, G.value), 26);
+  } else {
+    dText("---", x + w - 10, y + 40, 7, MR_DATUM, C_TRACK, 26);
   }
+}
+
+static void pageNord() {
+  dTitle("NORDSCHLEIFE");
+  nordCard(6,   26,  152, G_OIL_T);
+  nordCard(162, 26,  152, G_OIL_P);
+  nordCard(6,   94,  152, G_GEAR);
+  nordCard(162, 94,  152, G_HALDEX);
+  nordCard(6,   162, 152, G_CAT);
+  nordCard(162, 162, 152, G_INTAKE);
 }
 
 static void tempRow(int y, uint8_t g) {
@@ -504,7 +522,7 @@ static void drawPage(uint8_t idx, int ox) {
   gOx = ox;
   switch (idx) {
     case 0: pageDrive();   break;
-    case 1: pageEngine();  break;
+    case 1: pageNord();    break;
     case 2: pageTemps();   break;
     case 3: pageVehicle(); break;
     case PAGE_SPLASH: pageSplash(); break;
@@ -647,7 +665,7 @@ static int16_t  startX = 0, startY = 0, lastX = 0;
 static float    velocity = 0.f;                 // px/ms
 
 static void updateVisMask() {
-  uint8_t m = pageMask[page];
+  uint16_t m = pageMask[page];
   if (fabsf(slide) > 0.5f) {
     uint8_t nb = slide < 0 ? (page + 1) % PAGE_COUNT : (page + PAGE_COUNT - 1) % PAGE_COUNT;
     m |= pageMask[nb];
@@ -676,8 +694,8 @@ static void handleTouch(uint32_t now, float dtMs) {
     int dx = x - startX, dy = y - startY;
     if (!dragging && abs(dx) > 10 && abs(dx) > abs(dy)) dragging = true;
     if (dragging) {
-      slide = constrain((float)dx, -(SCR_W - 1.f), SCR_W - 1.f);
-      float inst = (x - lastX) / max(dtMs, 1.f);
+      slide = constrain((float)-dx, -(SCR_W - 1.f), SCR_W - 1.f);   // Seite laeuft gegen den Finger
+      float inst = -(x - lastX) / max(dtMs, 1.f);
       velocity = velocity * 0.6f + inst * 0.4f;
     } else if (!longDone && now - pressT >= 700 && abs(dx) < 12 && abs(dy) < 12) {
       longDone = true;
@@ -729,7 +747,7 @@ void ui_splash() {
   lastSig = 0;
 }
 
-uint8_t ui_visibleMask() { return visMask; }
+uint16_t ui_visibleMask() { return visMask; }
 
 void ui_tick() {
   const uint32_t now = millis();
