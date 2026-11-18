@@ -184,8 +184,11 @@ float decodeOilPressureBar(uint16_t raw16) {
 }
 
 // Oeltemperatur: DID 1065 (Motor-ECU 7E0), Rohwert in 1/10 Kelvin (0x0B1A = 2842 -> 11,05 C).
+// Kalibrierung: gegen den Bordcomputer gemessen zeigte das Dashboard konstant 10 C zu viel
+// (48 -> 58, 47 -> 57, nur im kalten Bereich geprueft). Bei warmem Motor gegenpruefen.
+#define OIL_TEMP_OFFSET_C (-10.0f)
 float decodeOilTempC(uint16_t raw16) {
-  return (float)raw16 / 10.0f - 273.15f;
+  return (float)raw16 / 10.0f - 273.15f + OIL_TEMP_OFFSET_C;
 }
 
 // Liefert true, wenn eine auswertbare Antwort kam (Timeout/Parsefehler = false).
