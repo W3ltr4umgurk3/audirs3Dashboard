@@ -32,14 +32,16 @@
 constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
   return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
-static const uint16_t C_BG    = rgb(5, 7, 12);
-static const uint16_t C_CARD  = rgb(15, 19, 29);
-static const uint16_t C_TRACK = rgb(34, 40, 56);
-static const uint16_t C_TEXT  = rgb(238, 242, 250);
-static const uint16_t C_DIM   = rgb(105, 116, 138);
-static const uint16_t C_ACC   = rgb(0, 206, 255);
-static const uint16_t C_OK    = rgb(0, 226, 150);
-static const uint16_t C_COLD  = rgb(64, 156, 255);
+// Palette: Anthrazit + Silber, Rot ist ausschliesslich Akzent (Titel, Einheiten, Seitenpunkte, Splash).
+// Normalbereich = Silber, "Achtung" = Amber, "kritisch" = blinkendes Rot (Rahmen/Warnleiste).
+static const uint16_t C_BG    = rgb(8, 8, 10);
+static const uint16_t C_CARD  = rgb(22, 23, 26);
+static const uint16_t C_TRACK = rgb(48, 50, 56);
+static const uint16_t C_TEXT  = rgb(236, 238, 242);
+static const uint16_t C_DIM   = rgb(134, 138, 148);
+static const uint16_t C_ACC   = rgb(228, 16, 16);
+static const uint16_t C_OK    = rgb(196, 200, 210);   // Silber
+static const uint16_t C_COLD  = rgb(112, 120, 138);   // gedecktes Stahlgrau (Motor noch kalt)
 static const uint16_t C_AMB   = rgb(255, 176, 0);
 static const uint16_t C_BAD   = rgb(255, 62, 62);
 
@@ -69,7 +71,7 @@ static const Stop stBatt[]   = {{10.f, C_BAD}, {11.7f, C_BAD}, {12.1f, C_OK}, {1
                                 {15.3f, C_BAD}, {16.f, C_BAD}};
 static const Stop stOilT[]   = {{0.f, C_COLD}, {60.f, C_COLD}, {80.f, C_OK}, {100.f, C_OK},
                                 {105.f, C_AMB}, {110.f, C_BAD}, {130.f, C_BAD}};
-static const Stop stAccent[] = {{0.f, C_ACC}, {1.f, rgb(120, 90, 255)}};
+static const Stop stAccent[] = {{0.f, rgb(110, 0, 0)}, {1.f, C_ACC}};
 
 #define NSTOPS(a) ((uint8_t)(sizeof(a) / sizeof((a)[0])))
 struct GaugeUi {
@@ -82,13 +84,13 @@ struct GaugeUi {
   float       minSpan;     // minimale Skalenbreite im Trendgraph
 };
 static const GaugeUi gui[GAUGE_COUNT] = {
-  {"OELDRUCK",   "OELDRUCK",  stOilP,   NSTOPS(stOilP),   1, true,  2.f},
-  {"LADEDRUCK",  "LADEDRUCK", stBoost,  NSTOPS(stBoost),  2, false, 0.5f},
-  {"GETRIEBE",   "GETRIEBE",  stGear,   NSTOPS(stGear),   0, false, 20.f},
-  {"ANSAUGLUFT", "ANSAUG",    stIntake, NSTOPS(stIntake), 0, false, 20.f},
+  {"OELDRUCK",   "OEL P",     stOilP,   NSTOPS(stOilP),   1, true,  2.f},
+  {"LADEDRUCK",  "LADE",     stBoost,  NSTOPS(stBoost),  2, false, 0.5f},
+  {"GETRIEBE",   "GETR.",     stGear,   NSTOPS(stGear),   0, false, 20.f},
+  {"ANSAUGLUFT", "LUFT",      stIntake, NSTOPS(stIntake), 0, false, 20.f},
   {"TANK",       "TANK",      stTank,   NSTOPS(stTank),   1, true,  5.f},
   {"BATTERIE",   "BATTERIE",  stBatt,   NSTOPS(stBatt),   1, true,  1.f},
-  {"OELTEMP",    "OELTEMP",   stOilT,   NSTOPS(stOilT),   0, false, 20.f},
+  {"OELTEMP",    "OEL T",     stOilT,   NSTOPS(stOilT),   0, false, 20.f},
 };
 
 // Welche Gauges zeigt welche Seite? (Bitmaske, fuer OBD-Abfragepriorisierung)
@@ -335,16 +337,17 @@ static void dTitle(const char* t) {
 static void card(int x, int y, int w, int h, uint8_t g) {
   const Gauge& G = gauges[g];
   dRRect(x, y, w, h, 7, C_CARD);
+  dRRectO(x, y, w, h, 7, C_TRACK);
   if (gBlink && inAlarm(g)) dRRectO(x, y, w, h, 7, C_BAD);
-  dText(gui[g].shortName, x + w / 2, y + 11, 1, MC_DATUM, C_DIM, 5);
+  dText(gui[g].shortName, x + w / 2, y + 12, 2, MC_DATUM, C_DIM, 9);
   char b[12];
   if (G.hasValue) {
     fmtValue(b, sizeof(b), g, G.value);
-    dText(b, x + w / 2, y + 41, 4, MC_DATUM, valColor(g, G.value), 14);
+    dText(b, x + w / 2, y + 38, 4, MC_DATUM, valColor(g, G.value), 14);
   } else {
-    dText("---", x + w / 2, y + 41, 4, MC_DATUM, C_TRACK, 14);
+    dText("---", x + w / 2, y + 38, 4, MC_DATUM, C_TRACK, 14);
   }
-  dUnit(G.unit, x + w / 2, y + 63, 1, C_DIM);
+  dUnit(G.unit, x + w / 2, y + 60, 2, C_ACC);
   gradBar(x + 7, y + h - 15, w - 14, 5, g);
 }
 
@@ -373,20 +376,17 @@ static void ringBlock(float cx, float cy, float rIn, float rOut, int segs, uint8
 static void pageDrive() {
   dTitle("DRIVE");
   const float cx = 160, cy = 124;
-  ringBlock(cx, cy, 78, 94, 54, G_BOOST, -44, -6, 32, 72);
+  ringBlock(cx, cy, 78, 94, 54, G_OIL_T, -44, -6, 32, 72);
 
-  // Skalenmarken: Nullpunkt (Atmosphaere) und Enden
-  const Gauge& B = gauges[G_BOOST];
-  float a0 = ARC_START + fracOf(G_BOOST, 0.f) * ARC_SWEEP;
-  dArcSeg(cx, cy, a0 - 0.012f, a0 + 0.012f, 96, 102, C_DIM);
-  dText("0", (int)(cx + cosf(a0) * 111), (int)(cy + sinf(a0) * 111), 1, MC_DATUM, C_DIM, 5);
+  // Skalenenden
+  const Gauge& T = gauges[G_OIL_T];
   char lo[8], hi[8];
-  snprintf(lo, sizeof(lo), "%g", B.minVal);
-  snprintf(hi, sizeof(hi), "%g", B.maxVal);
+  snprintf(lo, sizeof(lo), "%g", T.minVal);
+  snprintf(hi, sizeof(hi), "%g", T.maxVal);
   dText(lo, (int)cx - 70, (int)cy + 82, 1, MC_DATUM, C_DIM, 5);
   dText(hi, (int)cx + 70, (int)cy + 82, 1, MC_DATUM, C_DIM, 5);
 
-  card(4, 28, 62, 94, G_OIL_T);
+  card(4, 28, 62, 94, G_BOOST);
   card(4, 128, 62, 94, G_OIL_P);
   card(254, 28, 62, 94, G_GEAR);
   card(254, 128, 62, 94, G_INTAKE);
@@ -411,8 +411,9 @@ static void pageEngine() {
 static void tempRow(int y, uint8_t g) {
   const Gauge& G = gauges[g];
   dRRect(6, y, 308, 64, 8, C_CARD);
+  dRRectO(6, y, 308, 64, 8, C_TRACK);
   if (gBlink && inAlarm(g)) dRRectO(6, y, 308, 64, 8, C_BAD);
-  dText(gui[g].name, 16, y + 8, 1, ML_DATUM, C_DIM, 5);
+  dText(gui[g].name, 128, y + 9, 2, ML_DATUM, C_DIM, 9);
   char b[12];
   if (G.hasValue) {
     fmtValue(b, sizeof(b), g, G.value);
@@ -425,9 +426,9 @@ static void tempRow(int y, uint8_t g) {
     char m[20], v[12];
     fmtValue(v, sizeof(v), g, G.maxValue);
     snprintf(m, sizeof(m), "MAX %s", v);
-    dText(m, 306, y + 8, 1, MR_DATUM, C_DIM, 5);
+    dText(m, 306, y + 9, 2, MR_DATUM, C_DIM, 9);
   }
-  sparkline(128, y + 16, HIST_N * 2, 42, g);
+  sparkline(128, y + 20, HIST_N * 2, 38, g);
 }
 
 static void pageTemps() {
@@ -440,8 +441,9 @@ static void pageTemps() {
 static void bigBar(int y, uint8_t g, const char* tag, uint16_t tagCol) {
   const Gauge& G = gauges[g];
   dRRect(6, y, 308, 72, 8, C_CARD);
+  dRRectO(6, y, 308, 72, 8, C_TRACK);
   if (gBlink && inAlarm(g)) dRRectO(6, y, 308, 72, 8, C_BAD);
-  dText(gui[g].name, 16, y + 9, 1, ML_DATUM, C_DIM, 5);
+  dText(gui[g].name, 160, y + 13, 2, ML_DATUM, C_DIM, 9);
   if (tag) dText(tag, 306, y + 9, 1, MR_DATUM, tagCol, 5);
   char b[12];
   if (G.hasValue) {
@@ -461,6 +463,7 @@ static void bigBar(int y, uint8_t g, const char* tag, uint16_t tagCol) {
 
 static void statusChip(int x, int y, int w, const char* name, const char* state, uint16_t dot) {
   dRRect(x, y, w, 44, 8, C_CARD);
+  dRRectO(x, y, w, 44, 8, C_TRACK);
   if (visY(y + 10, 24) && visX(x, w)) strip.fillCircle(x + 14 + gOx, y + 15 - gOy, 4, dot);
   dText(name, x + 25, y + 15, 2, ML_DATUM, C_TEXT, 9);
   dText(state, x + 12, y + 33, 1, ML_DATUM, C_DIM, 5);
@@ -516,7 +519,7 @@ static void drawOverlay() {
   if (visY(0, 24)) {
     bool toast = now < toastUntil;
     if (toast) {
-      dRect(0, 0, SCR_W, 24, rgb(0, 60, 80));
+      dRect(0, 0, SCR_W, 24, rgb(56, 10, 10));
       dText("PEAKS ZURUECKGESETZT", SCR_W / 2, 12, 2, MC_DATUM, C_ACC, 9);
     } else if (gAlert >= 0) {
       const Gauge& G = gauges[gAlert];
