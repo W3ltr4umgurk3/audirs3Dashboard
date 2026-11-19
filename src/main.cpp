@@ -92,10 +92,9 @@ volatile bool btConnected = false, elmReady = false;
 volatile bool dataDirty = false;
 bool useRespCount = true;     // ELM-Antwortanzahl anhaengen ("010B1"); wird bei "?" automatisch abgeschaltet
 uint8_t blePacketSeq = 0;
-uint32_t lastSessionKeepAlive = 0, btConnectTime = 0;
+uint32_t btConnectTime = 0;
 volatile uint32_t bleDisconnectedAt = 0;
 uint32_t activeHeader = 0x000;
-bool diagSessionStarted = false;   // Car Scanner sendet 1003 nur einmal pro Verbindung
 TaskHandle_t obdTaskHandle = NULL;
 char rawBuf[128];
 float smoothedVolt = 0.0f;
@@ -178,7 +177,6 @@ bool initELM() {
   elmRawCmd("ATSP6", 250);
   elmRawCmd("ATCAF1", 250);
   activeHeader = 0;
-  diagSessionStarted = false;   // 1003 wird nach jeder (Neu-)Initialisierung einmal gesendet
   Serial.println("ELM327 Bereit!");
   return true;
 }
@@ -239,16 +237,9 @@ static bool queryGaugeCore(uint8_t idx) {
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 
-  // Car Scanner sendet 1003 nur einmal pro Verbindung (nicht zyklisch), die 22er-Abfragen laufen danach weiter.
-  // (alt: alle 2 s ein 1003)
-  // if (def.mode == 22 && (millis() - lastSessionKeepAlive > 2000)) {
-  //   elmRawCmd("1003", 200);
-  //   lastSessionKeepAlive = millis();
-  // }
-  if (def.mode == 22 && !diagSessionStarted) {
-    elmRawCmd("1003", 200);
-    diagSessionStarted = true;
-  }
+  // Kein 1003: Car Scanner sendet fuer die Live-Daten (22er-Abfragen an 7E0/7E1/70F) keine
+  // Diagnosesitzung (im Log vom 19.11. 0 Treffer); die DIDs antworten in der Standardsitzung.
+  // 1003 bleibt nur in der Diagnose-Konsole (SCAN).
 
   // Angehaengte "1" = "genau 1 Antwort erwartet": der ELM antwortet sofort nach der ersten
   // Antwort, statt seinen vollen Timeout abzuwarten. Wird der Befehl mit "?" quittiert
