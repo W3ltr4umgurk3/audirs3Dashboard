@@ -719,11 +719,19 @@ static void handleTouch(uint32_t now, float dtMs) {
 // ---------------------------------------------------------------------------
 // Oeffentliche API
 // ---------------------------------------------------------------------------
-void ui_begin() {
+// Display (neu) starten: Hardware-Reset ueber TFT_RST, Controller-Register senden, Bild loeschen.
+// Mehrfach aufrufbar. Noetig, weil der ILI9341 bei zu spaet stabiler Versorgung die Init-Befehle
+// verpasst und dann nur Zufallsinhalt ("Rauschen") zeigt, waehrend der Touch (I2C) schon laeuft.
+static void tftBringUp() {
   tft.init();
   tft.setRotation(3);
   tft.invertDisplay(true);
   tft.fillScreen(C_BG);
+}
+
+void ui_begin() {
+  delay(250);       // Versorgung des Display-Moduls einschwingen lassen, bevor der Controller konfiguriert wird
+  tftBringUp();
   stripOk = strip.createSprite(SCR_W, STRIP_H) != NULL;
   if (!stripOk) Serial.println("[UI] Streifen-Sprite konnte nicht angelegt werden (zu wenig RAM)!");
   for (uint8_t g = 0; g < GAUGE_COUNT; g++) {
@@ -735,7 +743,10 @@ void ui_begin() {
 }
 
 void ui_splash() {
-  const uint32_t dur = 1100, t0 = millis();
+  // Zweiter Display-Start, jetzt wo Bluetooth/BLE laufen und die Versorgung sicher stabil ist.
+  // Faengt einen verpassten ersten Init ab (siehe tftBringUp).
+  tftBringUp();
+  const uint32_t dur = 3000, t0 = millis();   // Startlogo 3 s
   uint32_t el;
   while ((el = millis() - t0) < dur) {
     float p = (float)el / dur;
