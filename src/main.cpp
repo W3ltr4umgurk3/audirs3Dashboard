@@ -38,15 +38,19 @@ Gauge gauges[GAUGE_COUNT] = {
 
 struct PIDDef { uint8_t mode; uint16_t pid; uint32_t header; bool isExtended; };
 // mode 0 = noch nicht abfragbar (DID unbekannt) -> wird uebersprungen, Anzeige bleibt "---"
+// PIDs/DIDs entsprechen den Abfragen der Car-Scanner-App (aus deren ELM-Adapter-Log, Audi RS3 8V / DAZA / DQ500).
 const PIDDef pidDefs[GAUGE_COUNT] = {
-  {22, 0x10EB, 0x7E0, false}, // 0: Oeldruck (UDS DAZA, DID 10EB, 1/1000 bar)
+  {22, 0x177D, 0x7E0, false}, // 0: Oeldruck (Car Scanner: ECM, DID 177D, raw/10 = kPa absolut)
+  // {22, 0x10EB, 0x7E0, false}, // 0 (alt): Oeldruck (UDS DAZA, DID 10EB, 1/1000 bar)
   { 1, 0x0B,   0x7DF, false}, // 1: Ladedruck
-  {22, 0x2104, 0x7E1, false}, // 2: Getriebe (UDS DSG)
+  {22, 0x2104, 0x7E1, false}, // 2: Getriebe (DQ500 ATF, Byte0 = Grad C; von Car Scanner bestaetigt)
   { 1, 0x0F,   0x7DF, false}, // 3: Ansaugtemp
   { 1, 0x2F,   0x7DF, false}, // 4: Tankinhalt
   { 1, 0x42,   0x7DF, false}, // 5: Batterie
-  {22, 0x1065, 0x7E0, false}, // 6: Öltemperatur (UDS DAZA DID 1065, 1/10 K)
-  { 0, 0x0000, 0x70F, false}, // 7: Haldex-Temperatur (Steuergeraet 70F/779 gefunden, DID noch offen)
+  {22, 0x11BD, 0x7E0, false}, // 6: Oeltemperatur (Car Scanner: ECM, DID 11BD, raw/10 K, ohne Offset)
+  // {22, 0x1065, 0x7E0, false}, // 6 (alt): Oeltemperatur (UDS DAZA DID 1065, 1/10 K)
+  {22, 0x2BF1, 0x70F, false}, // 7: Haldex-Temperatur (Car Scanner: 70F/ATCRA779, DID 2BF1, 16 Bit little-endian)
+  // { 0, 0x0000, 0x70F, false}, // 7 (alt): Haldex noch ohne DID
   { 1, 0x3C,   0x7DF, false}  // 8: Katalysatortemperatur B1S1 (Standard-PID 013C, (A*256+B)/10-40)
 };
 
@@ -91,6 +95,7 @@ uint8_t blePacketSeq = 0;
 uint32_t lastSessionKeepAlive = 0, btConnectTime = 0;
 volatile uint32_t bleDisconnectedAt = 0;
 uint32_t activeHeader = 0x000;
+bool diagSessionStarted = false;   // Car Scanner sendet 1003 nur einmal pro Verbindung
 TaskHandle_t obdTaskHandle = NULL;
 char rawBuf[128];
 float smoothedVolt = 0.0f;
@@ -171,28 +176,41 @@ bool initELM() {
   elmRawCmd("ATS0", 250);
   elmRawCmd("ATH1", 250); 
   elmRawCmd("ATSP6", 250);
-  elmRawCmd("ATCAF1", 250); 
+  elmRawCmd("ATCAF1", 250);
   activeHeader = 0;
+  diagSessionStarted = false;   // 1003 wird nach jeder (Neu-)Initialisierung einmal gesendet
   Serial.println("ELM327 Bereit!");
   return true;
 }
 
-// Oeldruck: DID 10EB (Motor-ECU 7E0), Rohwert in 1/1000 bar. Aus Scan + Car-Scanner-Screenshot
-// abgeleitet (Motor aus: 0x03D9 = 985 -> 0,98 bar). Noch nicht bei laufendem Motor verifiziert.
+// Oeldruck: DID 177D (Motor-ECU 7E0), Rohwert in 1/10 kPa absolut = 1/1000 bar.
+// Car Scanner liest dieselbe Groesse (0x03D5 = 981 -> 98,1 kPa = 0,98 bar bei Motor aus; im Log bis ~573 kPa).
+// (alt: DID 10EB, gleiche Skalierung: 0x03D9 = 985 -> 0,98 bar)
 float decodeOilPressureBar(uint16_t raw16) {
   return (float)raw16 / 1000.0f;
 }
 
-// Oeltemperatur: DID 1065 (Motor-ECU 7E0), Rohwert in 1/10 Kelvin (0x0B1A = 2842 -> 11,05 C).
-// Kalibrierung: gegen den Bordcomputer gemessen zeigte das Dashboard konstant 10 C zu viel
-// (48 -> 58, 47 -> 57, nur im kalten Bereich geprueft). Bei warmem Motor gegenpruefen.
-#define OIL_TEMP_OFFSET_C (-10.0f)
+// Oeltemperatur: DID 11BD (Motor-ECU 7E0), Rohwert in 1/10 Kelvin (0x0B10 = 2832 -> 10,05 C).
+// Car Scanner rechnet ohne Offset (App und Dashboard stimmen so kalt ueberein).
+// Der fruehere Offset von -10 C (Vergleich mit dem Bordcomputer, nur kalt geprueft) ist deaktiviert;
+// bei warmem Motor gegenpruefen und ggf. wieder aktivieren.
+#define OIL_TEMP_OFFSET_C (0.0f)
+// #define OIL_TEMP_OFFSET_C (-10.0f)   // alt
 float decodeOilTempC(uint16_t raw16) {
   return (float)raw16 / 10.0f - 273.15f + OIL_TEMP_OFFSET_C;
 }
 
+// Haldex-Temperatur: DID 2BF1 auf 70F (Antwort-ID 779), 16 Bit little-endian (erstes Datenbyte = niedrigstes).
+// ACHTUNG: grobe Naeherung aus dem Car-Scanner-Log (0x5D95 -> 11,9 C; ca. 110 Zaehler je Grad C).
+// Nur ein Stuetzpunkt ist exakt -> bei warmer Fahrt (Adapter-Log + CSV-Export) nachkalibrieren.
+#define HALDEX_RAW_AT_0C     22650.0f
+#define HALDEX_COUNTS_PER_C  110.0f
+float decodeHaldexTempC(uint16_t rawLE) {
+  return ((float)rawLE - HALDEX_RAW_AT_0C) / HALDEX_COUNTS_PER_C;
+}
+
 // Liefert true, wenn eine auswertbare Antwort kam (Timeout/Parsefehler = false).
-bool queryGauge(uint8_t idx) {
+static bool queryGaugeCore(uint8_t idx) {
   if (!btConnected || !elmReady) return false;
   const PIDDef& def = pidDefs[idx];
   char cmd[32];
@@ -204,9 +222,15 @@ bool queryGauge(uint8_t idx) {
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 
-  if (def.mode == 22 && (millis() - lastSessionKeepAlive > 2000)) {
+  // Car Scanner sendet 1003 nur einmal pro Verbindung (nicht zyklisch), die 22er-Abfragen laufen danach weiter.
+  // (alt: alle 2 s ein 1003)
+  // if (def.mode == 22 && (millis() - lastSessionKeepAlive > 2000)) {
+  //   elmRawCmd("1003", 200);
+  //   lastSessionKeepAlive = millis();
+  // }
+  if (def.mode == 22 && !diagSessionStarted) {
     elmRawCmd("1003", 200);
-    lastSessionKeepAlive = millis();
+    diagSessionStarted = true;
   }
 
   // Angehaengte "1" = "genau 1 Antwort erwartet": der ELM antwortet sofort nach der ersten
@@ -245,10 +269,10 @@ bool queryGauge(uint8_t idx) {
     if (strstr(p, search)) p += strlen(search); else p += 2;
     if (strlen(p) < 2) return false;
 
-    if (idx == 0 && def.pid == 0x10EB) { // Oeldruck
+    if (idx == 0 && def.pid == 0x177D) { // Oeldruck (alt: 0x10EB)
       uint16_t raw16 = ((uint16_t)hexByte(p) << 8) | hexByte(p + 2);
       gauges[idx].value = decodeOilPressureBar(raw16);
-      DBG("[OIL PRESSURE RAW] DID 10EB: %04X -> %.3f bar\n", raw16, gauges[idx].value);
+      DBG("[OIL PRESSURE RAW] DID 177D: %04X -> %.3f bar\n", raw16, gauges[idx].value);
     }
     else if (idx == 1) { // Ladedruck
       float absBar = (float)hexByte(p) / 100.0f;
@@ -270,9 +294,14 @@ bool queryGauge(uint8_t idx) {
     else if (def.pid == 0x2104) { // Getriebe (DSG 7E1)
       gauges[idx].value = (float)hexByte(p); 
     }
-    else if (def.pid == 0x1065) { // Öltemperatur Motor ECU (UDS DID 1065)
+    else if (def.pid == 0x11BD) { // Öltemperatur Motor ECU (UDS DID 11BD, alt: 1065)
       uint16_t raw16 = ((uint16_t)hexByte(p) << 8) | hexByte(p + 2);
       gauges[idx].value = decodeOilTempC(raw16);
+    }
+    else if (def.pid == 0x2BF1) { // Haldex-Temperatur (70F, 16 Bit little-endian)
+      uint16_t rawLE = ((uint16_t)hexByte(p + 2) << 8) | hexByte(p);
+      gauges[idx].value = decodeHaldexTempC(rawLE);
+      DBG("[HALDEX RAW] DID 2BF1: %04X -> %.1f C\n", rawLE, gauges[idx].value);
     }
     
     if (gauges[idx].trackMax) {
@@ -290,6 +319,30 @@ bool queryGauge(uint8_t idx) {
   DBG("[OBD PARSE ERR] %-11s | Match '%s' nicht in Raw '%s' gefunden\n",
       gauges[idx].label, search, rawBuf);
   return false;
+}
+
+// Steuergeraete ausserhalb der Standard-OBD-IDs (Haldex 70F -> Antwort 779) brauchen wie in Car Scanner:
+//   ATSH<tx>, ATFCSH<tx>, ATFCSD300000, ATFCSM1, ATCRA<rx>  ->  Abfrage  ->  ATFCSM0, ATAR
+// Der Antwortfilter (ATCRA) und das manuelle Flow-Control werden danach wieder zurueckgesetzt,
+// damit die uebrigen Abfragen (7DF/7E0/7E1) unveraendert funktionieren.
+static bool queryGauge(uint8_t idx) {
+  if (!btConnected || !elmReady) return false;
+  const PIDDef& def = pidDefs[idx];
+  if (def.header != 0x70F) return queryGaugeCore(idx);
+
+  elmRawCmd("ATSH70F", 150);
+  elmRawCmd("ATFCSH70F", 150);
+  elmRawCmd("ATFCSD300000", 150);
+  elmRawCmd("ATFCSM1", 150);
+  elmRawCmd("ATCRA779", 150);
+  activeHeader = 0x70F;          // ATSH ist gesetzt -> Kern-Abfrage ueberspringt es
+
+  bool ok = queryGaugeCore(idx);
+
+  elmRawCmd("ATFCSM0", 150);
+  elmRawCmd("ATAR", 150);
+  activeHeader = 0;              // naechste Abfrage setzt ihren Header neu
+  return ok;
 }
 
 // Werte ohne frische Messung ausblenden, damit App und Display nie "eingefrorene" Zahlen als live zeigen.
