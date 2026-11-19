@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_system.h>
 #include "dashboard.h"
 #include "BluetoothSerial.h"
 #include <BLEDevice.h>
@@ -590,6 +591,15 @@ void setupBLE() {
 void setup() {
   Serial.begin(115200);
   delay(300);
+  // Reset-Grund fuer die Fehlersuche (Brownout = Versorgung bricht ein; POWERON = normales Einschalten)
+  {
+    esp_reset_reason_t rr = esp_reset_reason();
+    const char* name = rr == ESP_RST_POWERON ? "POWERON" : rr == ESP_RST_BROWNOUT ? "BROWNOUT" :
+                       rr == ESP_RST_SW ? "SOFTWARE" : rr == ESP_RST_PANIC ? "PANIC" :
+                       rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT ? "WATCHDOG" :
+                       rr == ESP_RST_EXT ? "EXTERN" : "ANDERE";
+    Serial.printf("[BOOT] Reset-Grund: %s (%d)\n", name, (int)rr);
+  }
   ui_begin();   // vor Bluetooth, solange noch genug zusammenhaengender RAM fuer den Framebuffer-Streifen frei ist
 
   SerialBT.begin("RS3-Dashboard", true);
