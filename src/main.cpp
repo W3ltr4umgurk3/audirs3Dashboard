@@ -262,11 +262,12 @@ static bool queryGaugeCore(uint8_t idx) {
   if (def.mode == 1) sprintf(search, "41%02X", (uint8_t)def.pid);
   else               sprintf(search, "62%04X", def.pid);
   
+  // Nur die exakte Antwortkennung (41<PID> bzw. 62<DID>) akzeptieren. Ein loses Suchen nach "62"
+  // konnte zufaellig in Header-/Datenbytes treffen und falsche Werte liefern.
   char* p = strstr(parseSrc, search);
-  if (!p && def.mode == 22) p = strstr(parseSrc, "62"); 
 
   if (p) {
-    if (strstr(p, search)) p += strlen(search); else p += 2;
+    p += strlen(search);
     if (strlen(p) < 2) return false;
 
     if (idx == 0 && def.pid == 0x177D) { // Oeldruck (alt: 0x10EB)
