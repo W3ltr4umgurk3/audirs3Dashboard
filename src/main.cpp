@@ -224,6 +224,17 @@ static void updateBaro() {
   if (bar >= 0.70f && bar <= 1.10f) baroBar = bar;
 }
 
+// Erwartete 11-Bit-Antwort-ID je Anfrage-Header (nur Steuergeraete, deren Antwort-ID bekannt ist).
+static const char* responseIdFor(uint32_t header) {
+  switch (header) {
+    case 0x7DF:            // Broadcast: Wir werten nur den Motor (7E8) aus
+    case 0x7E0: return "7E8";
+    case 0x7E1: return "7E9";
+    case 0x70F: return "779";
+    default:    return NULL;   // unbekannt -> keine Pruefung
+  }
+}
+
 // Liefert true, wenn eine auswertbare Antwort kam (Timeout/Parsefehler = false).
 static bool queryGaugeCore(uint8_t idx) {
   if (!btConnected || !elmReady) return false;
@@ -241,10 +252,11 @@ static bool queryGaugeCore(uint8_t idx) {
   // Diagnosesitzung (im Log vom 19.11. 0 Treffer); die DIDs antworten in der Standardsitzung.
   // 1003 bleibt nur in der Diagnose-Konsole (SCAN).
 
-  // Angehaengte "1" = "genau 1 Antwort erwartet": der ELM antwortet sofort nach der ersten
-  // Antwort, statt seinen vollen Timeout abzuwarten. Wird der Befehl mit "?" quittiert
-  // (aeltere Klone), schalten wir das Feature ab und senden ohne Suffix.
-  const char* suffix = useRespCount ? "1" : "";
+  // Angehaengte Zahl = erwartete Antwortanzahl: der ELM antwortet sofort nach so vielen Antworten,
+  // statt seinen vollen Timeout abzuwarten. 01 42 beantworten Motor (7E8) UND Getriebe (7E9) mit
+  // unterschiedlichen Werten -> 2 Antworten abwarten und unten gezielt die vom Motor nehmen.
+  // Wird der Befehl mit "?" quittiert (aeltere Klone), schalten wir das Feature ab.
+  const char* suffix = !useRespCount ? "" : ((def.mode == 1 && def.pid == 0x42) ? "2" : "1");
   if (def.mode == 1) snprintf(cmd, sizeof(cmd), "01%02X%s", (uint8_t)def.pid, suffix);
   else               snprintf(cmd, sizeof(cmd), "22%04X%s", def.pid, suffix);
 
@@ -272,7 +284,17 @@ static bool queryGaugeCore(uint8_t idx) {
   
   // Nur die exakte Antwortkennung (41<PID> bzw. 62<DID>) akzeptieren. Ein loses Suchen nach "62"
   // konnte zufaellig in Header-/Datenbytes treffen und falsche Werte liefern.
+  // Zusaetzlich muss die Antwort vom erwarteten Steuergeraet stammen (Antwort-ID + Laenge vor der Kennung,
+  // z.B. "7E8" "05" "62177D"), sonst gilt ein Treffer des Getriebes (7E9) als falsch und wird uebersprungen.
+  const char* respId = responseIdFor(def.header);
   char* p = strstr(parseSrc, search);
+  while (p && respId) {
+    ptrdiff_t off = p - rawBuf;
+    bool fromExpected = (off >= 5 && strncmp(p - 5, respId, 3) == 0) ||
+                        (off >= 7 && strncmp(p - 7, respId, 3) == 0);   // 2. Variante: Multiframe-Kopf
+    if (fromExpected) break;
+    p = strstr(p + 1, search);
+  }
 
   if (p) {
     p += strlen(search);
