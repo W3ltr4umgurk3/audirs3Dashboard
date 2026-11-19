@@ -209,6 +209,23 @@ float decodeHaldexTempC(uint16_t rawLE) {
   return ((float)rawLE - HALDEX_RAW_AT_0C) / HALDEX_COUNTS_PER_C;
 }
 
+// Umgebungsdruck (PID 01 33, A = kPa absolut) als Bezug fuer den Ladedruck.
+// Startwert 1,0 bar, bis eine plausible Messung vorliegt; unplausible Werte werden verworfen.
+static float baroBar = 1.0f;
+static void updateBaro() {
+  if (!btConnected || !elmReady) return;
+  if (activeHeader != 0x7DF) {
+    elmRawCmd("ATSH7DF", 150);
+    activeHeader = 0x7DF;
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+  if (!elmRawCmd(useRespCount ? "01331" : "0133", 400)) return;
+  char* p = strstr(rawBuf, "4133");
+  if (!p || strlen(p) < 6) return;
+  float bar = (float)hexByte(p + 4) / 100.0f;
+  if (bar >= 0.70f && bar <= 1.10f) baroBar = bar;
+}
+
 // Liefert true, wenn eine auswertbare Antwort kam (Timeout/Parsefehler = false).
 static bool queryGaugeCore(uint8_t idx) {
   if (!btConnected || !elmReady) return false;
@@ -277,7 +294,7 @@ static bool queryGaugeCore(uint8_t idx) {
     }
     else if (idx == 1) { // Ladedruck
       float absBar = (float)hexByte(p) / 100.0f;
-      gauges[idx].value = absBar - 1.0f; 
+      gauges[idx].value = absBar - baroBar;   // Ueberdruck relativ zum gemessenen Umgebungsdruck (01 33)
     }
     else if (def.pid == 0x42) { // Batterie
       float instantVolt = (float)(hexByte(p) * 256 + hexByte(p + 2)) / 1000.0f;
@@ -476,6 +493,7 @@ void obdTask(void* parameter) {
     // alle anderen nur jeden 4. Zyklus -> Warnungen bleiben global aktiv, Werte werden nicht "stale".
     const bool bgCycle = (cycle % 4) == 0;
     const uint16_t visible = ui_visibleMask();
+    if (includeSlow) updateBaro();
     for (uint8_t n = 0; n < GAUGE_COUNT && elmReady; n++) {
       uint8_t idx = pollOrder[n];
       if (pidDefs[idx].mode == 0) continue;            // DID noch unbekannt (Haldex)
